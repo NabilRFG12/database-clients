@@ -53,6 +53,7 @@ This is the layer Supabase Cloud has and never open-sourced. Two pieces:
 
 - Phase 1: one small Studio container per tenant + a launcher page at `studio.ourdomain.com` listing all clients (dropdown-like UX, ~95% of supabase.com feel). Studio containers can be started on demand to save RAM.
 - Phase 2 (optional, only if the launcher annoys us): use this Studio fork to add a true in-app project switcher. Real work; deferred.
+- **Client-facing Studio (opt-in per tenant):** some clients (~3–5) may be granted Studio access to their own backend. Supported naturally by the per-tenant design — each Studio container is wired to one tenant's stack only, so isolation holds. `tenantctl` exposes it via a flag (`--studio-access on`) that publishes `studio.<client>.api.ourdomain.com` behind per-client credentials (Caddy basic auth to start; upgrade path: shared Authelia/Authentik forward-auth for real logins/2FA/revocation). **Caveat:** self-hosted Studio has no roles — access means full admin power over that tenant (arbitrary SQL, service key visible, can drop tables). Mitigations: contract terms + nightly backups; optionally point a "viewer" client's Studio at a restricted Postgres role (read-only / no DDL) accepting some broken Studio features. RAM cost ≈ 150–300 MB per always-on client Studio.
 
 ### D6 — Accepted: operational model
 
@@ -97,6 +98,7 @@ The pattern is **validated** — multiple independent projects converged on "com
 5. Do any current clients use Realtime/Storage/Edge Functions? (Determines per-tenant templates; Edge Functions runtime was excluded so far.)
 6. Monitoring stack: panel-native `docker stats` vs. Grafana + cAdvisor.
 7. Naming/branding of subdomains (`<client>.api.ourdomain.com` pattern confirmed?).
+8. Client-facing Studio: which clients get it, basic auth vs. Authelia from day one, and full-admin vs. restricted-role access per client.
 
 ## 6. Next Steps
 
