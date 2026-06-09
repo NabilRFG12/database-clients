@@ -1,0 +1,32 @@
+# Shared layer: one Caddy in front of all tenants.
+# Start with: tenantctl init (creates the mt-proxy network and config.env).
+
+name: mt-shared
+
+services:
+  caddy:
+    container_name: mt-caddy
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    env_file:
+      - ../config.env
+    networks:
+      - proxy
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/tenants:/etc/caddy/tenants:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+networks:
+  proxy:
+    external: true
+    name: mt-proxy
+
+volumes:
+  caddy_data:
+  caddy_config:

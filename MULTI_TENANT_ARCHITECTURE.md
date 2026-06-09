@@ -103,7 +103,7 @@ The pattern is **validated** — multiple independent projects converged on "com
 ## 6. Next Steps
 
 1. Answer §5 questions → write the PRD.
-2. Scaffold `tenantctl` (compose template + secret generation + Caddy route generation) — the engine.
+2. ~~Scaffold `tenantctl` (compose template + secret generation + Caddy route generation) — the engine.~~ **Done — see [`multi-tenant/`](multi-tenant/README.md).**
 3. Stand up a test VPS, create 2–3 dummy tenants, measure real idle/load RAM against §3 estimates.
 4. Build the admin panel on top of `tenantctl`.
 5. Migrate one low-risk client end-to-end, then roll the rest.

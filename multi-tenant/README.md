@@ -1,0 +1,136 @@
+# Multi-Tenant Self-Hosted Supabase
+
+Run isolated Supabase backends for many clients on **one VPS**: one shared
+Caddy reverse proxy, one trimmed Supabase stack per client with hard Docker
+resource caps, and a `tenantctl` CLI that onboards a new client in about a
+minute.
+
+Design background and decisions: [`../MULTI_TENANT_ARCHITECTURE.md`](../MULTI_TENANT_ARCHITECTURE.md).
+
+```
+                       ┌───────────────── VPS ─────────────────┐
+ acme.api.you.com ────►│  Caddy (TLS + host routing)           │
+ beta.api.you.com ────►│    │                                  │
+ studio.acme.api... ──►│    │ (basic auth, opt-in per tenant)  │
+                       │    ▼                                  │
+                       │  tenant "acme": db + auth + rest      │
+                       │                 (+ realtime/storage/  │
+                       │                  studio, opt-in)      │
+                       │  tenant "beta": db + auth + rest      │
+                       │  ...                                  │
+                       │  tenantctl ← create/suspend/backup/...│
+                       └───────────────────────────────────────┘
+```
+
+## What each tenant gets
+
+| Piece                          | Isolation                                                               |
+| ------------------------------ | ----------------------------------------------------------------------- |
+| Postgres container             | Own database, own password, own RAM/CPU caps                            |
+| GoTrue (auth)                  | Own `auth` schema and users                                             |
+| PostgREST                      | Own REST API at `https://<name>.<base-domain>/rest/v1/`                 |
+| JWT secret + anon/service keys | Unique per tenant — a leaked key opens one client only                  |
+| Realtime / Storage             | Optional, only if that client's app uses them                           |
+| Studio + postgres-meta         | Optional, behind per-tenant basic auth at `studio.<name>.<base-domain>` |
+
+Dropped relative to the official single-project stack: Kong (replaced by the
+shared Caddy), Logflare/analytics, Vector, imgproxy (image transformation is
+off), edge functions, Supavisor. A minimal tenant idles around 350–500 MB.
+
+## Prerequisites
+
+- Linux server with Docker Engine + Compose v2, ports 80/443 free
+- A wildcard DNS record: `*.api.example.com -> <server IP>`
+- `openssl` (for secret/key generation)
+
+## Quickstart
+
+```bash
+cd multi-tenant
+
+# 1. One-time setup: config, mt-proxy network, shared Caddy
+./tenantctl init --base-domain api.example.com --email you@example.com
+
+# 2. Onboard a client
+./tenantctl create acme --ram 2g --cpus 2 --services storage
+
+#    -> prints SUPABASE_URL / SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY
+#       ready to paste into the client app's config
+```
+
+## Commands
+
+| Command                                                                                | What it does                                                                                |
+| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `tenantctl init --base-domain D --email E`                                             | Write `config.env`, create the `mt-proxy` network, start Caddy                              |
+| `tenantctl create NAME [--ram 1g] [--cpus 1] [--services realtime,storage] [--studio]` | Generate secrets, render the stack, start it, wire the Caddy route, print credentials       |
+| `tenantctl list`                                                                       | All tenants with running/suspended state                                                    |
+| `tenantctl info NAME`                                                                  | Re-print a tenant's credentials                                                             |
+| `tenantctl suspend NAME` / `resume NAME`                                               | Stop/start containers; suspended tenants use zero RAM, data kept                            |
+| `tenantctl backup NAME`                                                                | `pg_dump` to `backups/NAME-<timestamp>.sql.gz`                                              |
+| `tenantctl upgrade NAME`                                                               | Pull current image tags and recreate (edit tags in the tenant's `docker-compose.yml` first) |
+| `tenantctl studio NAME on\|off`                                                        | Grant/revoke client Studio access (adds the route + basic-auth credentials)                 |
+| `tenantctl delete NAME`                                                                | Destroy a tenant **including data** — asks for confirmation; back up first                  |
+
+## Layout
+
+```
+multi-tenant/
+├── tenantctl                  # the CLI (the engine — a future admin panel calls this)
+├── templates/
+│   ├── docker-compose.yml     # per-tenant stack (profiles: realtime, storage, studio)
+│   ├── tenant.env.tpl         # per-tenant secrets/settings
+│   ├── caddy-site.tpl         # per-tenant API routes
+│   └── caddy-studio.tpl       # per-tenant Studio route (basic auth)
+├── shared/
+│   ├── docker-compose.yml     # the shared Caddy
+│   └── caddy/Caddyfile        # imports tenants/*.caddy
+├── tenants/<name>/            # runtime: .env, compose file, db data, storage files (gitignored)
+├── shared/caddy/tenants/      # runtime: generated routes (gitignored)
+└── backups/                   # runtime: pg_dump output (gitignored)
+```
+
+## Routing
+
+Caddy replicates the official Kong path mapping per tenant domain:
+
+| Public path          | Upstream                            |
+| -------------------- | ----------------------------------- |
+| `/auth/v1/*`         | GoTrue `:9999` (prefix stripped)    |
+| `/rest/v1/*`         | PostgREST `:3000` (prefix stripped) |
+| `/graphql/v1`        | PostgREST `/rpc/graphql`            |
+| `/realtime/v1/api/*` | Realtime `/api/*`                   |
+| `/realtime/v1/*`     | Realtime `/socket/*` (websocket)    |
+| `/storage/v1/*`      | Storage `:5000` (prefix stripped)   |
+
+One intentional difference from Kong: there is no gateway-level `apikey`
+check. JWT verification still happens in PostgREST/GoTrue/Storage/Realtime
+themselves (supabase-js sends the key as a Bearer token), so authorization is
+unchanged — but unauthenticated requests reach the services instead of being
+rejected at the edge. If edge filtering matters, add rate limiting or an
+apikey matcher to `templates/caddy-site.tpl`.
+
+## Security notes
+
+- Tenant `.env` files hold all secrets (mode 600, gitignored). The printed
+  service_role key bypasses RLS — never ship it in client-side code.
+- All tenants share the `mt-proxy` Docker network so Caddy can reach them.
+  Cross-tenant requests on that network are possible at the network level but
+  useless without that tenant's credentials; tenant databases are **not** on
+  the shared network at all.
+- Client Studio access (`--studio` / `studio NAME on`) is full admin of that
+  tenant's backend — arbitrary SQL, visible service key. Hand out the
+  generated basic-auth credentials deliberately.
+- Email auto-confirm is ON by default so signup works before SMTP exists.
+  Configure SMTP in the tenant `.env` and set `ENABLE_EMAIL_AUTOCONFIRM=false`
+  for production auth flows.
+
+## Known gaps (v1)
+
+- Not yet validated on a real VPS — first task: create 2–3 dummy tenants on a
+  test box and measure idle/load RAM against the architecture doc estimates.
+- No scheduled backups yet — add a cron entry per tenant
+  (`tenantctl backup NAME`) or loop over `tenants/`.
+- No edge functions runtime, no Supavisor pooling, no log aggregation.
+- Suspended tenants keep their Caddy route and return 502 instead of a
+  friendly "suspended" page.
