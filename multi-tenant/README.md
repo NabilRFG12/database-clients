@@ -100,11 +100,34 @@ cd multi-tenant
 | `tenantctl studio NAME on\|off`                                                        | Grant/revoke client Studio access (adds the route + basic-auth credentials)                 |
 | `tenantctl delete NAME`                                                                | Destroy a tenant **including data** — asks for confirmation; back up first                  |
 
+## Admin panel
+
+A dark, shadcn-style web UI over `tenantctl` — create tenants from a form,
+see live per-tenant RAM, copy credentials, suspend/resume/backup/delete,
+and toggle client Studio access. Zero dependencies (Python stdlib only,
+no build step), so there is nothing to break on the server.
+
+```bash
+bash panel/install.sh     # systemd service, generates PANEL_PASSWORD into config.env
+```
+
+Security model: the panel can control Docker, so it binds to **127.0.0.1
+only** and is never exposed publicly. Reach it through an SSH tunnel:
+
+```bash
+ssh -L 8800:127.0.0.1:8800 root@<vps>
+# then open http://localhost:8800  (user: admin, password from install output)
+```
+
+Every UI action calls the same `tenantctl` commands you'd run by hand, so
+the CLI over SSH always remains the fallback if the panel is down.
+
 ## Layout
 
 ```
 multi-tenant/
-├── tenantctl                  # the CLI (the engine — a future admin panel calls this)
+├── tenantctl                  # the CLI engine (panel and humans both call this)
+├── panel/                     # admin web UI (panel.py) + installer (install.sh)
 ├── templates/
 │   ├── docker-compose.yml     # per-tenant stack (profiles: realtime, storage, studio)
 │   ├── tenant.env.tpl         # per-tenant secrets/settings

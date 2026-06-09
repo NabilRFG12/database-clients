@@ -16,7 +16,7 @@
 #   tenantctl backup-all
 #   tenantctl upgrade <name>
 #   tenantctl studio <name> on|off
-#   tenantctl delete <name>
+#   tenantctl delete <name> [--yes]
 #
 # Key generation logic follows docker/utils/generate-keys.sh, which derives
 # from Inder Singh's setup.sh (Apache License 2.0,
@@ -363,13 +363,22 @@ cmd_studio() {
 }
 
 cmd_delete() {
-    local name=$1
+    local name="" yes=false
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --yes) yes=true; shift ;;
+            *) name=$1; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "usage: tenantctl delete <name> [--yes]"
     require_tenant "$name"
-    echo "This permanently deletes tenant '$name' INCLUDING ITS DATABASE AND FILES."
-    echo "Last backup is your safety net — consider 'tenantctl backup $name' first."
-    printf "Type the tenant name to confirm: "
-    read -r confirmation
-    [ "$confirmation" = "$name" ] || die "confirmation did not match; aborting"
+    if ! $yes; then
+        echo "This permanently deletes tenant '$name' INCLUDING ITS DATABASE AND FILES."
+        echo "Last backup is your safety net — consider 'tenantctl backup $name' first."
+        printf "Type the tenant name to confirm: "
+        read -r confirmation
+        [ "$confirmation" = "$name" ] || die "confirmation did not match; aborting"
+    fi
     compose "$name" down -v --remove-orphans || true
     rm -f "$CADDY_TENANTS_DIR/$name.caddy"
     rm -rf "$(tenant_dir "$name")"
@@ -391,7 +400,7 @@ main() {
         backup-all) cmd_backup_all ;;
         upgrade) [ $# -eq 1 ] || die "usage: tenantctl upgrade <name>"; cmd_upgrade "$@" ;;
         studio)  [ $# -eq 2 ] || die "usage: tenantctl studio <name> on|off"; cmd_studio "$@" ;;
-        delete)  [ $# -eq 1 ] || die "usage: tenantctl delete <name>";  cmd_delete "$@" ;;
+        delete)  [ $# -ge 1 ] || die "usage: tenantctl delete <name> [--yes]"; cmd_delete "$@" ;;
         -h|--help|help) usage ;;
         *) die "unknown command: $cmd (run 'tenantctl help')" ;;
     esac
