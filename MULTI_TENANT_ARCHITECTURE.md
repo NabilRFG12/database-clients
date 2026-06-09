@@ -104,6 +104,6 @@ The pattern is **validated** — multiple independent projects converged on "com
 
 1. Answer §5 questions → write the PRD.
 2. ~~Scaffold `tenantctl` (compose template + secret generation + Caddy route generation) — the engine.~~ **Done — see [`multi-tenant/`](multi-tenant/README.md).**
-3. ~~Stand up a test environment, create dummy tenants, measure real idle/load RAM against §3 estimates.~~ **Done in a Docker sandbox — 2 tenants validated end-to-end (auth, REST, isolation, Studio, lifecycle); minimal tenant idles at ~107 MiB, beating the §3 estimate. See `multi-tenant/README.md` § Validated.** Remaining: confirm Let's Encrypt issuance + load behavior on a public VPS.
+3. ~~Stand up a test environment, create dummy tenants, measure real idle/load RAM against §3 estimates.~~ **Done in a Docker sandbox — 2 tenants validated end-to-end (auth, REST, isolation, Studio, lifecycle); minimal tenant idles at ~107 MiB, beating the §3 estimate. See `multi-tenant/README.md` § Validated.** **Production deploy confirmed 2026-06-09 on a Hetzner 4 GB VPS (`bootstrap-vps.sh`): real Let's Encrypt issuance, signup, REST, Studio auth all passed — demo tenant ≈ 410 MiB idle with Studio.** Remaining: load behavior under real client traffic.
 4. Build the admin panel on top of `tenantctl`.
 5. Migrate one low-risk client end-to-end, then roll the rest.

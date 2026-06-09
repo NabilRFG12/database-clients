@@ -153,10 +153,32 @@ apikey matcher to `templates/caddy-site.tpl`.
   Configure SMTP in the tenant `.env` and set `ENABLE_EMAIL_AUTOCONFIRM=false`
   for production auth flows.
 
-## Validated (2026-06-09, sandbox with real Docker daemon)
+## Validated
 
-Two tenants (`acme` with Studio, `beta` minimal) booted with `tenantctl` and
-passed end-to-end checks through Caddy with TLS:
+**2026-06-09, production VPS (Hetzner, Ubuntu 26.04, 2 vCPU / 4 GB):** full
+deploy via `bootstrap-vps.sh` passed end to end — hardening, Docker install,
+platform init, tenant creation, **real Let's Encrypt certificates** (API +
+Studio domains), signup, REST round-trip, and Studio basic auth. Demo tenant
+with Studio idles at ≈ 410 MiB; host at ≈ 1 GiB used with ~2.7 GiB free.
+
+Field notes from that deploy:
+
+- **Run bootstrap detached** (`tmux`, `screen`, or `setsid ... > log`) — it
+  restarts sshd partway through, and a dropped SSH channel mid-run could
+  leave the server half-configured.
+- **Verify key-only login works from a second session** before letting
+  `--ssh-pubkey` disable password auth. Use a passphraseless deploy key (or
+  an agent-loaded one) for non-interactive automation.
+- **Cloudflare free plan does not proxy wildcard records** — set the
+  `*.<base-domain>` record to _DNS only_ (grey cloud) or you get NXDOMAIN.
+  Also make sure you're editing the Cloudflare zone your registrar actually
+  delegates to.
+- Some providers (e.g. Hetzner) force a root password change on first
+  login — clear that before running automation against the box.
+
+**2026-06-09, sandbox with real Docker daemon:** two tenants (`acme` with
+Studio, `beta` minimal) booted with `tenantctl` and passed end-to-end checks
+through Caddy with TLS:
 
 - Auth health, user signup (returned a session JWT), REST OpenAPI, and a
   full insert/select round-trip with the generated keys
@@ -180,8 +202,8 @@ Gotchas found during validation:
 
 ## Known gaps (v1)
 
-- Validated in a sandbox, not yet on a public VPS — real-domain TLS issuance
-  (Let's Encrypt) and load behavior still to be confirmed.
+- Load behavior under real client traffic not yet measured (idle numbers
+  validated in sandbox + production).
 - Off-site backup shipping not included — bootstrap installs the nightly cron, but copying
   `backups/` to another machine/bucket is still manual.
 - No edge functions runtime, no Supavisor pooling, no log aggregation.
