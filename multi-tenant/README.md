@@ -102,7 +102,8 @@ cd multi-tenant
 
 ## Admin panel
 
-A dark, shadcn-style web UI over `tenantctl` — create tenants from a form,
+A dark, shadcn-style web UI over `tenantctl` — host KPIs (CPU, RAM with a
+"room for N more tenants" estimate, disk — color-coded bars), create tenants from a form,
 see live per-tenant RAM, copy credentials, suspend/resume/backup/delete,
 and toggle client Studio access. Zero dependencies (Python stdlib only,
 no build step), so there is nothing to break on the server.

@@ -14,8 +14,10 @@ import hmac
 import json
 import re
 import os
+import shutil
 import subprocess
 import sys
+import time
 from base64 import b64decode
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -120,6 +122,45 @@ def list_tenants():
     return tenants
 
 
+def _cpu_sample():
+    fields = Path("/proc/stat").read_text().splitlines()[0].split()[1:]
+    nums = [int(n) for n in fields]
+    idle = nums[3] + (nums[4] if len(nums) > 4 else 0)  # idle + iowait
+    return idle, sum(nums)
+
+
+def host_stats():
+    idle1, total1 = _cpu_sample()
+    time.sleep(0.3)
+    idle2, total2 = _cpu_sample()
+    delta = total2 - total1
+    cpu_pct = round(100 * (1 - (idle2 - idle1) / delta), 1) if delta > 0 else 0.0
+
+    meminfo = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        key, _, value = line.partition(":")
+        meminfo[key] = int(value.strip().split()[0])  # kB
+    mem_total = meminfo.get("MemTotal", 0) / 1024
+    mem_avail = meminfo.get("MemAvailable", 0) / 1024
+    mem_used = mem_total - mem_avail
+
+    disk = shutil.disk_usage("/")
+    return {
+        "cores": os.cpu_count() or 1,
+        "load1": round(os.getloadavg()[0], 2),
+        "cpu_pct": cpu_pct,
+        "mem_total_mib": round(mem_total),
+        "mem_used_mib": round(mem_used),
+        "mem_pct": round(100 * mem_used / mem_total, 1) if mem_total else 0,
+        "disk_total_gb": round(disk.total / 1024**3, 1),
+        "disk_used_gb": round(disk.used / 1024**3, 1),
+        "disk_pct": round(100 * disk.used / disk.total, 1) if disk.total else 0,
+        # rough headroom: how many more light tenants (~400 MiB working set)
+        # fit while keeping 20% of RAM free for the host
+        "tenant_headroom": max(0, int((mem_avail - 0.2 * mem_total) // 400)),
+    }
+
+
 def tenant_creds(name):
     env = read_env_file(TENANTS_DIR / name / ".env")
     creds = {
@@ -203,6 +244,7 @@ class Handler(BaseHTTPRequestHandler):
                 "tenants": tenants,
                 "running": sum(1 for t in tenants if t["state"] == "running"),
                 "total_mem_mib": round(sum(t["mem_mib"] for t in tenants), 1),
+                "host": host_stats(),
             })
         elif self.path.startswith("/api/tenants/"):
             name = self._tenant_name(self.path.split("/")[3])
@@ -300,10 +342,21 @@ PAGE = r"""<!doctype html>
   .spacer{flex:1}
 
   main{max-width:1060px;margin:0 auto;padding:28px}
-  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:22px}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:14px}
   .stat{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px}
   .stat .k{font-size:12px;color:var(--muted)}
   .stat .v{font-size:24px;font-weight:600;letter-spacing:-.02em;margin-top:2px}
+  .stat .v small{font-size:13px;font-weight:400;color:var(--muted2)}
+  .stat .hint{font-size:11px;color:var(--muted2);margin-top:4px}
+  .bar{height:6px;border-radius:999px;background:var(--card2);border:1px solid var(--border);
+    margin-top:10px;overflow:hidden}
+  .bar i{display:block;height:100%;border-radius:999px;background:var(--accent);
+    transition:width .4s ease, background .4s ease}
+  .bar.warn i{background:var(--amber)}
+  .bar.crit i{background:var(--danger)}
+  .pressure{display:flex;gap:10px;align-items:flex-start;margin-top:14px;padding:10px 12px;
+    border:1px solid rgba(251,191,36,.35);background:rgba(251,191,36,.08);
+    border-radius:8px;font-size:12.5px;color:var(--amber)}
 
   .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius)}
   .card-head{display:flex;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border)}
@@ -392,6 +445,26 @@ PAGE = r"""<!doctype html>
 
 <main>
   <div class="stats">
+    <div class="stat">
+      <div class="k">VPS CPU</div>
+      <div class="v" id="hCpu">–</div>
+      <div class="bar" id="hCpuBar"><i style="width:0%"></i></div>
+      <div class="hint" id="hCpuHint"></div>
+    </div>
+    <div class="stat">
+      <div class="k">VPS RAM</div>
+      <div class="v" id="hMem">–</div>
+      <div class="bar" id="hMemBar"><i style="width:0%"></i></div>
+      <div class="hint" id="hMemHint"></div>
+    </div>
+    <div class="stat">
+      <div class="k">VPS Disk</div>
+      <div class="v" id="hDisk">–</div>
+      <div class="bar" id="hDiskBar"><i style="width:0%"></i></div>
+      <div class="hint" id="hDiskHint"></div>
+    </div>
+  </div>
+  <div class="stats">
     <div class="stat"><div class="k">Tenants</div><div class="v" id="stTotal">–</div></div>
     <div class="stat"><div class="k">Running</div><div class="v" id="stRun">–</div></div>
     <div class="stat"><div class="k">Fleet RAM (live)</div><div class="v" id="stMem">–</div></div>
@@ -429,9 +502,32 @@ function toast(msg, err){
   setTimeout(() => el.remove(), err ? 9000 : 3500);
 }
 
+function setBar(id, pct){
+  const bar = document.getElementById(id);
+  bar.className = 'bar' + (pct >= 85 ? ' crit' : pct >= 70 ? ' warn' : '');
+  bar.firstElementChild.style.width = Math.min(100, pct) + '%';
+}
+function renderHost(h){
+  document.getElementById('hCpu').innerHTML = h.cpu_pct + '<small>%</small>';
+  setBar('hCpuBar', h.cpu_pct);
+  document.getElementById('hCpuHint').textContent = h.cores + ' cores · load ' + h.load1;
+
+  const gib = m => (m/1024).toFixed(1);
+  document.getElementById('hMem').innerHTML = gib(h.mem_used_mib) + '<small> / ' + gib(h.mem_total_mib) + ' GiB</small>';
+  setBar('hMemBar', h.mem_pct);
+  document.getElementById('hMemHint').textContent = h.tenant_headroom > 0
+    ? '≈ room for ' + h.tenant_headroom + ' more light tenant' + (h.tenant_headroom === 1 ? '' : 's')
+    : 'no headroom — scale the VPS before adding tenants';
+
+  document.getElementById('hDisk').innerHTML = h.disk_used_gb + '<small> / ' + h.disk_total_gb + ' GB</small>';
+  setBar('hDiskBar', h.disk_pct);
+  document.getElementById('hDiskHint').textContent = (h.disk_total_gb - h.disk_used_gb).toFixed(1) + ' GB free';
+}
+
 async function refresh(){
   try { S = await api('/api/state'); } catch(e){ toast(e.message, true); return; }
   document.getElementById('domainChip').textContent = '*.' + S.base_domain;
+  renderHost(S.host);
   document.getElementById('stTotal').textContent = S.tenants.length;
   document.getElementById('stRun').textContent = S.running;
   document.getElementById('stMem').textContent = S.total_mem_mib >= 1024
@@ -506,8 +602,16 @@ async function showInfo(name){
 }
 
 function openCreate(){
+  const h = S && S.host;
+  let warn = '';
+  if(h && (h.mem_pct >= 80 || h.disk_pct >= 85)){
+    warn = '<div class="pressure">⚠ <span>The VPS is under ' +
+      (h.mem_pct >= 80 ? 'memory' : 'disk') + ' pressure (' +
+      (h.mem_pct >= 80 ? 'RAM ' + h.mem_pct : 'disk ' + h.disk_pct) + '%). ' +
+      'Consider scaling the server before adding this tenant.</span></div>';
+  }
   openDlg(
-    '<div class="dlg-head"><h3>New tenant</h3><p>Creates an isolated Supabase backend with its own database, auth and keys.</p></div>' +
+    '<div class="dlg-head"><h3>New tenant</h3><p>Creates an isolated Supabase backend with its own database, auth and keys.</p>' + warn + '</div>' +
     '<div class="dlg-body">' +
     '<label>Client name</label><input type="text" id="fName" placeholder="acmecorp" autocomplete="off">' +
     '<div class="grid2"><div><label>RAM cap (database)</label><select id="fRam">' +
