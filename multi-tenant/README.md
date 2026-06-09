@@ -43,6 +43,33 @@ off), edge functions, Supavisor. A minimal tenant idles around 350–500 MB.
 - A wildcard DNS record: `*.api.example.com -> <server IP>`
 - `openssl` (for secret/key generation)
 
+## Deploying a fresh VPS (recommended path)
+
+Buy an Ubuntu 24.04 VPS (16 GB RAM / 4 vCPU / 100 GB+ disk is comfortable
+for ~11 light clients), SSH in as root, then:
+
+```bash
+# Lean clone — downloads only the files this platform needs, not the whole monorepo
+git clone --depth 1 --filter=blob:none --sparse \
+  -b claude/epic-allen-zz92as https://github.com/NabilRFG12/database-clients.git
+cd database-clients
+git sparse-checkout set multi-tenant docker/volumes/db
+cd multi-tenant
+
+bash bootstrap-vps.sh --base-domain api.example.com --email you@example.com
+```
+
+`bootstrap-vps.sh` hardens first, deploys second: firewall (only SSH/80/443
+open), fail2ban, automatic security updates, then Docker, `tenantctl init`,
+and a nightly 03:00 backup cron (`tenantctl backup-all`). Pass
+`--ssh-pubkey "ssh-ed25519 AAAA..."` to also install your key and disable
+password login in the same run.
+
+It finishes by printing the wildcard DNS record to add
+(`*.api.example.com -> <server IP>`) and the smoke-test command. Off-site
+copying of `backups/` is the one thing it can't do for you — set that up
+before onboarding real clients.
+
 ## Quickstart
 
 ```bash
@@ -68,6 +95,7 @@ cd multi-tenant
 | `tenantctl info NAME`                                                                  | Re-print a tenant's credentials                                                             |
 | `tenantctl suspend NAME` / `resume NAME`                                               | Stop/start containers; suspended tenants use zero RAM, data kept                            |
 | `tenantctl backup NAME`                                                                | `pg_dump` to `backups/NAME-<timestamp>.sql.gz`                                              |
+| `tenantctl backup-all`                                                                 | Back up every running tenant (used by the nightly cron)                                     |
 | `tenantctl upgrade NAME`                                                               | Pull current image tags and recreate (edit tags in the tenant's `docker-compose.yml` first) |
 | `tenantctl studio NAME on\|off`                                                        | Grant/revoke client Studio access (adds the route + basic-auth credentials)                 |
 | `tenantctl delete NAME`                                                                | Destroy a tenant **including data** — asks for confirmation; back up first                  |
@@ -154,8 +182,8 @@ Gotchas found during validation:
 
 - Validated in a sandbox, not yet on a public VPS — real-domain TLS issuance
   (Let's Encrypt) and load behavior still to be confirmed.
-- No scheduled backups yet — add a cron entry per tenant
-  (`tenantctl backup NAME`) or loop over `tenants/`.
+- Off-site backup shipping not included — bootstrap installs the nightly cron, but copying
+  `backups/` to another machine/bucket is still manual.
 - No edge functions runtime, no Supavisor pooling, no log aggregation.
 - Suspended tenants keep their Caddy route and return 502 instead of a
   friendly "suspended" page.

@@ -13,6 +13,7 @@
 #   tenantctl suspend <name>
 #   tenantctl resume <name>
 #   tenantctl backup <name>
+#   tenantctl backup-all
 #   tenantctl upgrade <name>
 #   tenantctl studio <name> on|off
 #   tenantctl delete <name>
@@ -313,6 +314,20 @@ cmd_backup() {
     echo "backup written: $out"
 }
 
+cmd_backup_all() {
+    local dir name failures=0
+    for dir in "$TENANTS_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        name=$(basename "$dir")
+        if docker ps --format '{{.Names}}' | grep -qx "$name-db"; then
+            cmd_backup "$name" || { echo "backup FAILED for '$name'" >&2; failures=$((failures+1)); }
+        else
+            echo "skipping '$name' (suspended)"
+        fi
+    done
+    return $failures
+}
+
 cmd_upgrade() {
     require_tenant "$1"
     compose "$1" pull
@@ -373,6 +388,7 @@ main() {
         suspend) [ $# -eq 1 ] || die "usage: tenantctl suspend <name>"; cmd_suspend "$@" ;;
         resume)  [ $# -eq 1 ] || die "usage: tenantctl resume <name>";  cmd_resume "$@" ;;
         backup)  [ $# -eq 1 ] || die "usage: tenantctl backup <name>";  cmd_backup "$@" ;;
+        backup-all) cmd_backup_all ;;
         upgrade) [ $# -eq 1 ] || die "usage: tenantctl upgrade <name>"; cmd_upgrade "$@" ;;
         studio)  [ $# -eq 2 ] || die "usage: tenantctl studio <name> on|off"; cmd_studio "$@" ;;
         delete)  [ $# -eq 1 ] || die "usage: tenantctl delete <name>";  cmd_delete "$@" ;;
