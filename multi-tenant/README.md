@@ -125,10 +125,35 @@ apikey matcher to `templates/caddy-site.tpl`.
   Configure SMTP in the tenant `.env` and set `ENABLE_EMAIL_AUTOCONFIRM=false`
   for production auth flows.
 
+## Validated (2026-06-09, sandbox with real Docker daemon)
+
+Two tenants (`acme` with Studio, `beta` minimal) booted with `tenantctl` and
+passed end-to-end checks through Caddy with TLS:
+
+- Auth health, user signup (returned a session JWT), REST OpenAPI, and a
+  full insert/select round-trip with the generated keys
+- **Cross-tenant isolation:** each tenant's service_role key is rejected by
+  the other tenant's API (`PGRST301`); auth users and tables fully separate
+- Studio behind basic auth: 401 without credentials, full UI with them
+- `list`, `suspend`, `resume`, `backup`, `studio on/off` lifecycle
+- Idle RAM, measured: minimal tenant ≈ **107 MiB** (db 83 + auth 10 + rest 15);
+  with Studio + meta ≈ 380 MiB; Caddy 15 MiB
+
+Gotchas found during validation:
+
+- **PostgREST schema cache** — after creating tables via psql/migrations, run
+  `NOTIFY pgrst, 'reload schema';` (or restart the rest container) or new
+  tables 404. DDL run through Studio's SQL editor still needs this too.
+- **Registry rate limits** — anonymous Docker Hub pulls can be throttled on
+  shared/datacenter IPs. Supabase images are mirrored at
+  `public.ecr.aws/supabase/<image>` and Hub library images at
+  `mirror.gcr.io/library/<image>`; pull from there and `docker tag` to the
+  compose names, or `docker login` with a free account.
+
 ## Known gaps (v1)
 
-- Not yet validated on a real VPS — first task: create 2–3 dummy tenants on a
-  test box and measure idle/load RAM against the architecture doc estimates.
+- Validated in a sandbox, not yet on a public VPS — real-domain TLS issuance
+  (Let's Encrypt) and load behavior still to be confirmed.
 - No scheduled backups yet — add a cron entry per tenant
   (`tenantctl backup NAME`) or loop over `tenants/`.
 - No edge functions runtime, no Supavisor pooling, no log aggregation.
