@@ -6,7 +6,9 @@
 
 	handle /graphql/v1 {
 		rewrite * /rpc/graphql
-		reverse_proxy @@TENANT_NAME@@-rest:3000
+		reverse_proxy @@TENANT_NAME@@-rest:3000 {
+			header_up Content-Profile graphql_public
+		}
 	}
 
 	handle_path /auth/v1/* {

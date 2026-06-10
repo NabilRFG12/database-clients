@@ -8,6 +8,9 @@
 # Usage:
 #   tenantctl init --base-domain api.example.com --email you@example.com
 #   tenantctl create <name> [--ram 1g] [--cpus 1] [--services realtime,storage] [--studio]
+#                    [--jwt-secret S --anon-key K --service-key K]   (migration: import identity)
+#   tenantctl add-domain <name> <domain>      (route an old client domain to this tenant)
+#   tenantctl remove-domain <name> <domain>
 #   tenantctl list
 #   tenantctl info <name>
 #   tenantctl suspend <name>
@@ -120,12 +123,16 @@ reload_caddy() {
 }
 
 write_caddy_routes() { # write_caddy_routes <name>  (re-renders from .env)
-    local name=$1 domain studio_domain profiles out
+    local name=$1 domain studio_domain profiles out hosts extra d
     domain=$(env_get "$name" TENANT_DOMAIN)
     studio_domain=$(env_get "$name" STUDIO_DOMAIN)
     profiles=$(env_get "$name" COMPOSE_PROFILES)
+    # Extra hostnames (migrated client domains) share the tenant's API site.
+    hosts=$domain
+    extra=$(env_get "$name" EXTRA_DOMAINS)
+    for d in $extra; do hosts+=", $d"; done
     out=$(render "$TEMPLATES_DIR/caddy-site.tpl" \
-        "TENANT_NAME=$name" "TENANT_DOMAIN=$domain")
+        "TENANT_NAME=$name" "TENANT_DOMAIN=$hosts")
     if [[ ",$profiles," == *",studio,"* ]]; then
         local user pass hash
         user=$(env_get "$name" DASHBOARD_USERNAME)
@@ -204,12 +211,16 @@ cmd_create() {
     need docker; need openssl
     load_config
     local name="" ram="1g" cpus="1" services="" studio=false
+    local import_jwt="" import_anon="" import_service=""
     while [ $# -gt 0 ]; do
         case $1 in
             --ram) ram=$2; shift 2 ;;
             --cpus) cpus=$2; shift 2 ;;
             --services) services=$2; shift 2 ;;
             --studio) studio=true; shift ;;
+            --jwt-secret) import_jwt=$2; shift 2 ;;
+            --anon-key) import_anon=$2; shift 2 ;;
+            --service-key) import_service=$2; shift 2 ;;
             -*) die "unknown option for create: $1" ;;
             *) [ -z "$name" ] || die "unexpected argument: $1"; name=$1; shift ;;
         esac
@@ -218,6 +229,9 @@ cmd_create() {
     [[ $name =~ $NAME_PATTERN ]] \
         || die "invalid name '$name' (lowercase letters, digits, hyphens; 3-20 chars)"
     [ ! -d "$(tenant_dir "$name")" ] || die "tenant '$name' already exists"
+    if [ -n "$import_anon$import_service" ] && [ -z "$import_jwt" ]; then
+        die "--anon-key/--service-key require --jwt-secret (keys must verify against the secret)"
+    fi
 
     local profiles=""
     local svc
@@ -242,10 +256,15 @@ cmd_create() {
         cp "$DB_INIT_SRC/$sql" "$dir/db/$sql"
     done
 
+    # Migration support: import an existing project's identity so already-
+    # deployed apps (and live user sessions) keep working unchanged.
     local jwt_secret anon_key service_key
-    jwt_secret=$(openssl rand -base64 30)
-    anon_key=$(gen_jwt anon "$jwt_secret")
-    service_key=$(gen_jwt service_role "$jwt_secret")
+    jwt_secret=${import_jwt:-$(openssl rand -base64 30)}
+    anon_key=${import_anon:-$(gen_jwt anon "$jwt_secret")}
+    service_key=${import_service:-$(gen_jwt service_role "$jwt_secret")}
+    if [ -n "$import_jwt" ]; then
+        echo "Using imported JWT secret${import_anon:+ and API keys} (migration mode)."
+    fi
 
     render "$TEMPLATES_DIR/tenant.env.tpl" \
         "TENANT_NAME=$name" \
@@ -362,6 +381,50 @@ cmd_studio() {
     fi
 }
 
+cmd_add_domain() { # add-domain <name> <domain>
+    local name=$1 domain=$2 extra
+    require_tenant "$name"
+    [[ $domain =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || die "invalid domain: $domain"
+    extra=$(env_get "$name" EXTRA_DOMAINS)
+    case " $extra " in *" $domain "*) die "domain '$domain' already added" ;; esac
+    env_set "$name" EXTRA_DOMAINS "${extra:+$extra }$domain"
+    write_caddy_routes "$name"
+    reload_caddy
+    cat <<EOF
+Domain '$domain' now routes to tenant '$name'.
+
+Make sure its DNS points here:  $domain  ->  this server's IP
+(Caddy will keep retrying certificate issuance until DNS resolves.)
+
+For auth emails/redirects to use this domain, also set in $(tenant_dir "$name")/.env:
+  API_EXTERNAL_URL=https://$domain
+  SITE_URL=<the client app's URL>
+then re-apply with: tenantctl resume $name
+EOF
+}
+
+cmd_remove_domain() { # remove-domain <name> <domain>
+    local name=$1 domain=$2 extra new=""
+    require_tenant "$name"
+    extra=$(env_get "$name" EXTRA_DOMAINS)
+    local d found=false
+    for d in $extra; do
+        if [ "$d" = "$domain" ]; then found=true; else new+="${new:+ }$d"; fi
+    done
+    $found || die "domain '$domain' is not attached to tenant '$name'"
+    env_set "$name" EXTRA_DOMAINS "$new"
+    write_caddy_routes "$name"
+    reload_caddy
+    echo "domain '$domain' removed from tenant '$name'"
+}
+
+cmd_rerender() { # re-generate a tenant's Caddy routes from the current template
+    require_tenant "$1"
+    write_caddy_routes "$1"
+    reload_caddy
+    echo "routes re-rendered for tenant '$1'"
+}
+
 cmd_delete() {
     local name="" yes=false
     while [ $# -gt 0 ]; do
@@ -400,6 +463,9 @@ main() {
         backup-all) cmd_backup_all ;;
         upgrade) [ $# -eq 1 ] || die "usage: tenantctl upgrade <name>"; cmd_upgrade "$@" ;;
         studio)  [ $# -eq 2 ] || die "usage: tenantctl studio <name> on|off"; cmd_studio "$@" ;;
+        rerender)      [ $# -eq 1 ] || die "usage: tenantctl rerender <name>"; cmd_rerender "$@" ;;
+        add-domain)    [ $# -eq 2 ] || die "usage: tenantctl add-domain <name> <domain>";    cmd_add_domain "$@" ;;
+        remove-domain) [ $# -eq 2 ] || die "usage: tenantctl remove-domain <name> <domain>"; cmd_remove_domain "$@" ;;
         delete)  [ $# -ge 1 ] || die "usage: tenantctl delete <name> [--yes]"; cmd_delete "$@" ;;
         -h|--help|help) usage ;;
         *) die "unknown command: $cmd (run 'tenantctl help')" ;;
