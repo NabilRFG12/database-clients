@@ -19,6 +19,7 @@
 #   tenantctl backup-all
 #   tenantctl upgrade <name>
 #   tenantctl studio <name> on|off
+#   tenantctl fix-storage-xattrs <name>       (after migrating storage files; see MIGRATION.md)
 #   tenantctl delete <name> [--yes]
 #
 # Key generation logic follows docker/utils/generate-keys.sh, which derives
@@ -425,6 +426,63 @@ cmd_rerender() { # re-generate a tenant's Caddy routes from the current template
     echo "routes re-rendered for tenant '$1'"
 }
 
+# Newer storage-api versions (>= ~1.40) read each object's metadata from POSIX
+# extended attributes on the file. Files copied from an older storage-api (or
+# by tar/rsync without --xattrs) lack them, and every download 500s with
+# {"code":"ENODATA"}. This rebuilds the xattrs from the already-restored
+# storage.objects rows — non-destructive, idempotent, DB rows untouched.
+cmd_fix_storage_xattrs() {
+    local name=$1
+    require_tenant "$name"
+    need python3
+    local data_dir
+    data_dir="$(tenant_dir "$name")/storage-data"
+    [ -d "$data_dir/stub/$name" ] \
+        || die "no $data_dir/stub/$name — copy the files there first (MIGRATION.md section 3)"
+    docker exec "$name-db" psql -U supabase_admin -d postgres -tA -F $'\x01' -c \
+        "select bucket_id, name, coalesce(version,''),
+                coalesce(metadata->>'mimetype',''), coalesce(metadata->>'cacheControl','')
+         from storage.objects" \
+      | TENANT="$name" DATA_DIR="$data_dir" python3 - <<'PY'
+import os, sys
+tenant, root = os.environ["TENANT"], os.environ["DATA_DIR"]
+fixed = ok = missing = 0
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    bucket, name, version, mime, cache = line.split("\x01")
+    path = os.path.join(root, "stub", tenant, bucket, name, version)
+    if not os.path.isfile(path):
+        # pre-version layout: the object file sits directly at <name>
+        alt = os.path.join(root, "stub", tenant, bucket, name)
+        if os.path.isfile(alt):
+            path = alt
+        else:
+            missing += 1
+            print(f"  MISSING on disk: {bucket}/{name} (version: {version or 'none'})")
+            continue
+    want = {}
+    if mime:
+        want["user.supabase.content-type"] = mime.encode()
+    if cache:
+        want["user.supabase.cache-control"] = cache.encode()
+    changed = False
+    for attr, value in want.items():
+        try:
+            if os.getxattr(path, attr) == value:
+                continue
+        except OSError:
+            pass
+        os.setxattr(path, attr, value)
+        changed = True
+    fixed += changed
+    ok += not changed
+print(f"xattrs: {fixed} fixed, {ok} already correct, {missing} missing on disk")
+sys.exit(1 if missing else 0)
+PY
+}
+
 cmd_delete() {
     local name="" yes=false
     while [ $# -gt 0 ]; do
@@ -464,6 +522,7 @@ main() {
         upgrade) [ $# -eq 1 ] || die "usage: tenantctl upgrade <name>"; cmd_upgrade "$@" ;;
         studio)  [ $# -eq 2 ] || die "usage: tenantctl studio <name> on|off"; cmd_studio "$@" ;;
         rerender)      [ $# -eq 1 ] || die "usage: tenantctl rerender <name>"; cmd_rerender "$@" ;;
+        fix-storage-xattrs) [ $# -eq 1 ] || die "usage: tenantctl fix-storage-xattrs <name>"; cmd_fix_storage_xattrs "$@" ;;
         add-domain)    [ $# -eq 2 ] || die "usage: tenantctl add-domain <name> <domain>";    cmd_add_domain "$@" ;;
         remove-domain) [ $# -eq 2 ] || die "usage: tenantctl remove-domain <name> <domain>"; cmd_remove_domain "$@" ;;
         delete)  [ $# -ge 1 ] || die "usage: tenantctl delete <name> [--yes]"; cmd_delete "$@" ;;

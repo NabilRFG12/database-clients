@@ -97,8 +97,9 @@ cd multi-tenant
 | `tenantctl backup NAME`                                                                | `pg_dump` to `backups/NAME-<timestamp>.sql.gz`                                              |
 | `tenantctl backup-all`                                                                 | Back up every running tenant (used by the nightly cron)                                     |
 | `tenantctl upgrade NAME`                                                               | Pull current image tags and recreate (edit tags in the tenant's `docker-compose.yml` first) |
-| `tenantctl create NAME --jwt-secret S --anon-key K --service-key K`                   | Migration mode: tenant inherits an old project's identity (see `MIGRATION.md`)             |
-| `tenantctl add-domain NAME D` / `remove-domain NAME D`                                 | Route an extra (old client) domain to the tenant — zero-app-change cutover                 |
+| `tenantctl create NAME --jwt-secret S --anon-key K --service-key K`                    | Migration mode: tenant inherits an old project's identity (see `MIGRATION.md`)              |
+| `tenantctl add-domain NAME D` / `remove-domain NAME D`                                 | Route an extra (old client) domain to the tenant — zero-app-change cutover                  |
+| `tenantctl fix-storage-xattrs NAME`                                                    | Rebuild storage-file xattrs from `storage.objects` after a migration (see `MIGRATION.md`)   |
 | `tenantctl studio NAME on\|off`                                                        | Grant/revoke client Studio access (adds the route + basic-auth credentials)                 |
 | `tenantctl delete NAME`                                                                | Destroy a tenant **including data** — asks for confirmation; back up first                  |
 

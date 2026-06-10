@@ -68,10 +68,30 @@ docker stop clientx-auth clientx-rest clientx-storage 2>/dev/null
 gunzip -c /root/clientx-migration.sql.gz | docker exec -i clientx-db psql -U supabase_admin -d postgres
 ```
 
-Expected: ~4 errors about `graphql_public.graphql ... does not exist` (drop
-ordering; fixed in the next step). Errors about _tables_ are the ones that
-matter. This restore brings the app schema **plus `auth` users, refresh
-tokens, and `storage` metadata** — that's why sessions survive.
+Expected: **a few dozen benign errors** — the count varies with which
+services the tenant runs. From a real migration (~30 errors, all benign):
+
+- `role "supabase_realtime_admin" does not exist` (×15) — the tenant was
+  created without the realtime service, so that role/schema isn't
+  bootstrapped. Harmless when the client doesn't use realtime.
+- `schema/type/relation ... already exists` and `cannot drop ... because
+other objects depend on it` (auth/storage objects, `users_pkey`, ...) —
+  from restoring over the already-bootstrapped auth/storage schemas.
+- `graphql_public.graphql ... does not exist` (×4) — drop ordering; fixed
+  in the next step.
+
+**The error count is NOT the verification.** Prove the restore by comparing
+row counts OLD vs NEW — they must be identical for every table:
+
+```bash
+# Run on BOTH old and new db containers and diff the output:
+docker exec clientx-db psql -U supabase_admin -d postgres -tAc \
+  "select schemaname||'.'||relname||' '||n_live_tup
+   from pg_stat_user_tables order by 1;"
+```
+
+This restore brings the app schema **plus `auth` users, refresh tokens, and
+`storage` metadata** — that's why sessions survive.
 
 ### 2b. Post-restore fixup (always run this)
 
@@ -100,14 +120,48 @@ SQL
 
 ## 3. Copy storage files (skip if no buckets)
 
+The file backend's on-disk path is
+`<GLOBAL_S3_BUCKET>/<TENANT_ID>/<bucket>/<object-name>/<version>` (confirmed
+empirically by uploading a probe object). Both segments are env-driven:
+
+- OLD single-project self-host: `stub/stub/...` (both default to `stub`)
+- Our tenants: `stub/<tenant-name>/...` (`TENANT_ID` is the tenant name)
+
+So the fix is renaming the **second**-level directory — the top-level `stub`
+stays:
+
 ```bash
 # On OLD: the files live in docker/volumes/storage
 rsync -a ~/supabase/docker/volumes/storage/ root@NEW:~/database-clients/multi-tenant/tenants/clientx/storage-data/
 
-# On NEW: the file backend namespaces by tenant id — ours is the tenant name.
-# OLD self-host uses "stub" (check what the top-level directory is called):
-ls ~/database-clients/multi-tenant/tenants/clientx/storage-data/
-mv .../storage-data/stub .../storage-data/clientx   # only if a 'stub' dir exists
+# On NEW: re-namespace from the old tenant id to ours
+cd ~/database-clients/multi-tenant/tenants/clientx/storage-data
+mv stub/stub stub/clientx
+```
+
+### 3b. Rebuild xattrs (always run this if files were copied)
+
+Newer storage-api versions (the tenant runs v1.60.x) read each object's
+metadata from **POSIX extended attributes** on the file. Files written by an
+older storage-api (e.g. v1.28.x) never had them, and `tar`/`rsync` don't copy
+xattrs by default — so every download returns **HTTP 500 with
+`{"code":"ENODATA"}`** ("The extended attribute does not exist").
+
+Rebuild them from the already-restored `storage.objects` rows (non-destructive
+and idempotent — DB rows are untouched, so owner/created_at/version survive):
+
+```bash
+./tenantctl fix-storage-xattrs clientx
+# -> xattrs: N fixed, M already correct, 0 missing on disk
+```
+
+Any "MISSING on disk" lines mean files that exist in `storage.objects` but
+weren't copied — re-check the rsync before going live. Then spot-check a real
+download:
+
+```bash
+curl -sI "https://clientx.db.backend.stream/storage/v1/object/authenticated/<bucket>/<name>" \
+  -H "Authorization: Bearer $OLDSERVICE"   # expect 200 + correct Content-Type
 ```
 
 ## 4. Start and smoke-test with the OLD keys
@@ -136,9 +190,21 @@ succeeded.
 ./tenantctl resume clientx
 ```
 
-Then flip DNS: `api.clientx.com  A  -> <NEW server IP>`. Caddy issues the
-certificate automatically once DNS resolves. The deployed apps notice
-nothing: same URL, same keys, new server.
+Then flip DNS: `api.clientx.com  A  -> <NEW server IP>`.
+
+**After DNS resolves to NEW, nudge Caddy:**
+
+```bash
+./tenantctl rerender clientx   # graceful Caddy reload -> immediate cert issuance
+```
+
+This is needed because `add-domain` triggers eager certificate issuance while
+DNS still points at OLD — the ACME HTTP-01 challenge hits the old server,
+404s, and Caddy enters a retry **backoff** (it would eventually recover, but
+"eventually" can be a long gap). A graceful reload re-triggers issuance
+immediately; verified in the field — the cert issued right after the reload.
+
+The deployed apps notice nothing: same URL, same keys, new server.
 
 (Alternative if you control the app build: skip add-domain, point the app's
 `SUPABASE_URL` at `clientx.db.backend.stream`, redeploy the app.)

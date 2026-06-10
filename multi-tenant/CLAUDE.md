@@ -19,14 +19,14 @@ routing replicating Kong's path map) on the external `mt-proxy` network.
 
 ## Key files
 
-| File | Role |
-| --- | --- |
-| `tenantctl` | Bash CLI — ALL tenant operations live here |
-| `templates/docker-compose.yml` | Per-tenant stack (copied verbatim; reads tenant `.env`) |
-| `templates/tenant.env.tpl`, `templates/caddy-*.tpl` | Rendered with `@@VAR@@` placeholders |
-| `shared/` | Shared Caddy compose + Caddyfile (imports `tenants/*.caddy`) |
-| `panel/panel.py` | Admin UI — single file, Python stdlib ONLY |
-| `bootstrap-vps.sh` | Fresh-server setup: hardening FIRST, then Docker + init |
+| File                                                | Role                                                         |
+| --------------------------------------------------- | ------------------------------------------------------------ |
+| `tenantctl`                                         | Bash CLI — ALL tenant operations live here                   |
+| `templates/docker-compose.yml`                      | Per-tenant stack (copied verbatim; reads tenant `.env`)      |
+| `templates/tenant.env.tpl`, `templates/caddy-*.tpl` | Rendered with `@@VAR@@` placeholders                         |
+| `shared/`                                           | Shared Caddy compose + Caddyfile (imports `tenants/*.caddy`) |
+| `panel/panel.py`                                    | Admin UI — single file, Python stdlib ONLY                   |
+| `bootstrap-vps.sh`                                  | Fresh-server setup: hardening FIRST, then Docker + init      |
 
 Runtime state (gitignored, never commit): `tenants/`, `backups/`, `config.env`,
 `shared/caddy/tenants/*.caddy`.
@@ -55,7 +55,10 @@ Runtime state (gitignored, never commit): `tenants/`, `backups/`, `config.env`,
    `realtime-dev.` prefix (tenant id is parsed from the Host header).
 8. Migrations follow `MIGRATION.md` exactly: dump/restore as `supabase_admin`
    (not `postgres`), always run the §2b pg_graphql fixup, `NOTIFY pgrst, 'reload
-   schema'` after out-of-band DDL.
+schema'` after out-of-band DDL, `tenantctl fix-storage-xattrs` after copying
+   storage files (newer storage-api 500s without xattrs), and `tenantctl
+rerender` after the DNS flip (cert issuance is in ACME backoff until then).
+   Verify restores by row counts, not error counts.
 9. Secrets never go into git, chat replies, or PR text. Tenant `.env` files are
    chmod 600.
 10. Validate changes against a real Docker daemon when possible (`bash -n` +
