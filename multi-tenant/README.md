@@ -91,6 +91,7 @@ cd multi-tenant
 | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `tenantctl init --base-domain D --email E`                                             | Write `config.env`, create the `mt-proxy` network, start Caddy                              |
 | `tenantctl create NAME [--ram 1g] [--cpus 1] [--services realtime,storage] [--studio]` | Generate secrets, render the stack, start it, wire the Caddy route, print credentials       |
+| `tenantctl set NAME [--ram 2g] [--cpus 2] [--services realtime,storage]`               | Edit an existing tenant's caps/services and apply live (brief db restart on new caps)       |
 | `tenantctl list`                                                                       | All tenants with running/suspended state                                                    |
 | `tenantctl info NAME`                                                                  | Re-print a tenant's credentials                                                             |
 | `tenantctl suspend NAME` / `resume NAME`                                               | Stop/start containers; suspended tenants use zero RAM, data kept                            |
@@ -108,8 +109,10 @@ Per-client migration from an old single-project VPS: see [`MIGRATION.md`](MIGRAT
 ## Admin panel
 
 A dark, shadcn-style web UI over `tenantctl` — host KPIs (CPU, RAM with a
-"room for N more tenants" estimate, disk — color-coded bars), create tenants from a form,
-see live per-tenant RAM, copy credentials, suspend/resume/backup/delete,
+"room for N more tenants" estimate, disk — color-coded bars), create tenants
+from a form, edit a tenant's RAM/CPU caps and services in place, see live
+per-tenant RAM against its cap, filter the tenant list, copy credentials
+(including the Postgres superuser password), suspend/resume/backup/delete,
 and toggle client Studio access. Zero dependencies (Python stdlib only,
 no build step), so there is nothing to break on the server.
 

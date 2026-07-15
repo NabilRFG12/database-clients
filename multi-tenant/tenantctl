@@ -9,6 +9,8 @@
 #   tenantctl init --base-domain api.example.com --email you@example.com
 #   tenantctl create <name> [--ram 1g] [--cpus 1] [--services realtime,storage] [--studio]
 #                    [--jwt-secret S --anon-key K --service-key K]   (migration: import identity)
+#   tenantctl set <name> [--ram 1g] [--cpus 1] [--services realtime,storage]
+#                    (edit an existing tenant's caps/services; studio via 'tenantctl studio')
 #   tenantctl add-domain <name> <domain>      (route an old client domain to this tenant)
 #   tenantctl remove-domain <name> <domain>
 #   tenantctl list
@@ -157,6 +159,10 @@ Tenant '$name' is up. App configuration:
   SUPABASE_ANON_KEY=$(env_get "$name" ANON_KEY)
   SUPABASE_SERVICE_ROLE_KEY=$(env_get "$name" SERVICE_ROLE_KEY)
 
+Postgres superuser password (db is internal-only; use via docker exec or Studio):
+
+  POSTGRES_PASSWORD=$(env_get "$name" POSTGRES_PASSWORD)
+
 EOF
     local profiles
     profiles=$(env_get "$name" COMPOSE_PROFILES)
@@ -289,6 +295,71 @@ cmd_create() {
     compose "$name" up -d
     reload_caddy
     print_credentials "$name"
+}
+
+cmd_set() { # set <name> [--ram 1g] [--cpus 1] [--services realtime,storage]
+    need docker
+    local name="" ram="" cpus="" services="" services_given=false
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --ram) ram=$2; shift 2 ;;
+            --cpus) cpus=$2; shift 2 ;;
+            --services) services=$2; services_given=true; shift 2 ;;
+            -*) die "unknown option for set: $1" ;;
+            *) [ -z "$name" ] || die "unexpected argument: $1"; name=$1; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "set requires a tenant name"
+    require_tenant "$name"
+    if [ -z "$ram" ] && [ -z "$cpus" ] && ! $services_given; then
+        die "nothing to change — pass --ram, --cpus and/or --services"
+    fi
+    [ -z "$ram" ] || [[ $ram =~ ^[0-9]+(m|g)$ ]] || die "invalid --ram '$ram' (e.g. 512m, 1g)"
+    [ -z "$cpus" ] || [[ $cpus =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "invalid --cpus '$cpus' (e.g. 0.5, 2)"
+
+    local old_profiles new_profiles svc
+    old_profiles=$(env_get "$name" COMPOSE_PROFILES)
+    new_profiles=$old_profiles
+    if $services_given; then
+        new_profiles=""
+        for svc in ${services//,/ }; do
+            case $svc in
+                realtime|storage)
+                    [[ ",$new_profiles," == *",$svc,"* ]] || new_profiles+="${new_profiles:+,}$svc" ;;
+                *) die "unknown service '$svc' (available: realtime, storage)" ;;
+            esac
+        done
+        # Studio is managed by 'tenantctl studio <name> on|off' — preserve it here.
+        if [[ ",$old_profiles," == *",studio,"* ]]; then
+            new_profiles+="${new_profiles:+,}studio"
+        fi
+    fi
+
+    [ -z "$ram" ]  || env_set "$name" TENANT_DB_MEM_LIMIT "$ram"
+    [ -z "$cpus" ] || env_set "$name" TENANT_DB_CPUS "$cpus"
+    [ "$new_profiles" = "$old_profiles" ] || env_set "$name" COMPOSE_PROFILES "$new_profiles"
+
+    local running
+    running=$(compose "$name" ps --status running --quiet 2>/dev/null | wc -l)
+    if [ "$running" -gt 0 ]; then
+        # Recreates only containers whose config changed; a new db cap means
+        # a brief database restart.
+        compose "$name" up -d --remove-orphans
+        # Compose does not treat profile-disabled services as orphans, so
+        # containers of removed services must go explicitly (as in cmd_studio).
+        local cname
+        for svc in realtime storage; do
+            if [[ ",$old_profiles," == *",$svc,"* ]] && [[ ",$new_profiles," != *",$svc,"* ]]; then
+                cname="$name-$svc"
+                [ "$svc" = realtime ] && cname="realtime-dev.$name-realtime"
+                docker rm -f "$cname" >/dev/null 2>&1 || true
+            fi
+        done
+        echo "tenant '$name' updated and applied"
+    else
+        echo "tenant '$name' updated (suspended — applies on 'tenantctl resume $name')"
+    fi
+    echo "  db RAM cap: $(env_get "$name" TENANT_DB_MEM_LIMIT), cpus: $(env_get "$name" TENANT_DB_CPUS), services: ${new_profiles:-none}"
 }
 
 cmd_list() {
@@ -513,6 +584,7 @@ main() {
     case $cmd in
         init)    cmd_init "$@" ;;
         create)  cmd_create "$@" ;;
+        set)     cmd_set "$@" ;;
         list)    cmd_list "$@" ;;
         info)    [ $# -eq 1 ] || die "usage: tenantctl info <name>";    cmd_info "$@" ;;
         suspend) [ $# -eq 1 ] || die "usage: tenantctl suspend <name>"; cmd_suspend "$@" ;;
