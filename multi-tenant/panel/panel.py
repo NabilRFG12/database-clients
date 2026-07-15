@@ -117,6 +117,7 @@ def list_tenants():
                 "state": "running" if up else "suspended",
                 "containers": len(up),
                 "ram_limit": env.get("TENANT_DB_MEM_LIMIT", ""),
+                "cpus": env.get("TENANT_DB_CPUS", ""),
                 "mem_mib": round(sum(stats.get(c, 0.0) for c in tenant_containers(name, stats)), 1),
             })
     return tenants
@@ -168,6 +169,7 @@ def tenant_creds(name):
         "url": "https://" + env.get("TENANT_DOMAIN", ""),
         "anon_key": env.get("ANON_KEY", ""),
         "service_role_key": env.get("SERVICE_ROLE_KEY", ""),
+        "db_password": env.get("POSTGRES_PASSWORD", ""),
         "studio": "studio" in env.get("COMPOSE_PROFILES", ""),
     }
     if creds["studio"]:
@@ -293,12 +295,36 @@ class Handler(BaseHTTPRequestHandler):
             return self._error("create failed:\n" + out[-2000:], 500)
         self._json(tenant_creds(name))
 
+    def _edit(self, name, body):
+        args = ["set", name]
+        ram = (body.get("ram") or "").strip()
+        cpus = str(body.get("cpus") or "").strip()
+        if ram:
+            if not RAM_RE.match(ram):
+                return self._error("invalid ram value")
+            args += ["--ram", ram]
+        if cpus:
+            if not CPUS_RE.match(cpus):
+                return self._error("invalid cpus value")
+            args += ["--cpus", cpus]
+        if isinstance(body.get("services"), list):
+            services = [s for s in body["services"] if s in SERVICES]
+            args += ["--services", ",".join(services)]
+        if len(args) == 2:
+            return self._error("nothing to change")
+        code, out = ctl(*args)
+        if code != 0:
+            return self._error("edit failed:\n" + out[-2000:], 500)
+        self._json({"ok": True, "output": out[-2000:]})
+
     def _action(self, name, body):
         action = body.get("action", "")
         if action in ("suspend", "resume", "backup"):
             code, out = ctl(action, name)
         elif action in ("studio_on", "studio_off"):
             code, out = ctl("studio", name, action.split("_")[1])
+        elif action == "edit":
+            return self._edit(name, body)
         elif action == "delete":
             if body.get("confirm") != name:
                 return self._error("confirmation text does not match tenant name")
@@ -318,79 +344,118 @@ PAGE = r"""<!doctype html>
 <title>Supabase Fleet</title>
 <style>
   :root{
-    --bg:#09090b; --card:#101012; --card2:#141417; --border:#26262b;
-    --text:#fafafa; --muted:#a1a1aa; --muted2:#71717a;
-    --accent:#3ecf8e; --accent-dim:rgba(62,207,142,.12);
+    --bg:#09090b; --bg2:#0c0c0f; --card:#101013; --card2:#16161a; --border:#232329;
+    --border2:#2e2e36; --text:#fafafa; --muted:#a1a1aa; --muted2:#6b6b76;
+    --accent:#3ecf8e; --accent-dim:rgba(62,207,142,.12); --accent-line:rgba(62,207,142,.35);
     --danger:#f87171; --danger-dim:rgba(248,113,113,.12);
-    --amber:#fbbf24; --radius:10px;
+    --amber:#fbbf24; --radius:12px;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--text);
+  body{margin:0;background:
+      radial-gradient(1200px 400px at 50% -220px, rgba(62,207,142,.07), transparent 60%),
+      var(--bg);
+    color:var(--text);
     font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
     -webkit-font-smoothing:antialiased}
   a{color:var(--accent);text-decoration:none}
   a:hover{text-decoration:underline}
+  svg{display:block}
+  .ic{display:inline-flex;vertical-align:-2px}
 
   header{display:flex;align-items:center;gap:12px;padding:14px 28px;
-    border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(9,9,11,.85);
-    backdrop-filter:blur(8px);z-index:5}
-  .logo{width:26px;height:26px;border-radius:7px;background:var(--accent-dim);
-    display:grid;place-items:center;color:var(--accent);font-weight:700}
+    border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(9,9,11,.82);
+    backdrop-filter:blur(10px);z-index:5}
+  .logo{width:28px;height:28px;border-radius:8px;background:var(--accent-dim);
+    border:1px solid var(--accent-line);display:grid;place-items:center;color:var(--accent)}
   .brand{font-weight:600;letter-spacing:-.01em}
   .chip{font-size:12px;color:var(--muted);border:1px solid var(--border);
-    border-radius:999px;padding:2px 10px;background:var(--card)}
+    border-radius:999px;padding:2px 10px;background:var(--card);font-family:ui-monospace,Menlo,monospace}
   .spacer{flex:1}
 
-  main{max-width:1060px;margin:0 auto;padding:28px}
-  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:14px}
-  .stat{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px}
-  .stat .k{font-size:12px;color:var(--muted)}
-  .stat .v{font-size:24px;font-weight:600;letter-spacing:-.02em;margin-top:2px}
+  main{max-width:1100px;margin:0 auto;padding:26px 28px 60px}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:16px}
+  .stat{background:linear-gradient(180deg,var(--card) 0%,var(--bg2) 100%);
+    border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px}
+  .stat .k{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted)}
+  .stat .k .ic{color:var(--muted2)}
+  .stat .v{font-size:26px;font-weight:600;letter-spacing:-.02em;margin-top:6px;
+    font-variant-numeric:tabular-nums}
   .stat .v small{font-size:13px;font-weight:400;color:var(--muted2)}
-  .stat .hint{font-size:11px;color:var(--muted2);margin-top:4px}
+  .stat .hint{font-size:11.5px;color:var(--muted2);margin-top:5px}
   .bar{height:6px;border-radius:999px;background:var(--card2);border:1px solid var(--border);
-    margin-top:10px;overflow:hidden}
+    margin-top:12px;overflow:hidden}
   .bar i{display:block;height:100%;border-radius:999px;background:var(--accent);
     transition:width .4s ease, background .4s ease}
   .bar.warn i{background:var(--amber)}
   .bar.crit i{background:var(--danger)}
+  .bar.mini{height:4px;margin-top:5px;border:0;background:#1d1d22}
   .pressure{display:flex;gap:10px;align-items:flex-start;margin-top:14px;padding:10px 12px;
     border:1px solid rgba(251,191,36,.35);background:rgba(251,191,36,.08);
     border-radius:8px;font-size:12.5px;color:var(--amber)}
 
-  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius)}
-  .card-head{display:flex;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border)}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+    overflow:hidden}
+  .card-head{display:flex;align-items:center;gap:12px;padding:13px 18px;
+    border-bottom:1px solid var(--border);flex-wrap:wrap}
   .card-head h2{margin:0;font-size:15px;font-weight:600}
+  .summary{font-size:12.5px;color:var(--muted2)}
+  .summary b{color:var(--muted);font-weight:500}
+  .search{position:relative;margin-left:auto}
+  .search .ic{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--muted2);
+    pointer-events:none}
+  .search input[type=text]{width:210px;font-size:13px;
+    padding:6px 10px 6px 32px;transition:border-color .12s}
 
-  table{width:100%;border-collapse:collapse}
-  th{font-size:12px;text-align:left;color:var(--muted2);font-weight:500;padding:10px 18px;border-bottom:1px solid var(--border)}
-  td{padding:12px 18px;border-bottom:1px solid var(--border);vertical-align:middle}
+  .tablewrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;min-width:760px}
+  th{font-size:11.5px;text-align:left;color:var(--muted2);font-weight:500;
+    text-transform:uppercase;letter-spacing:.05em;padding:10px 18px;border-bottom:1px solid var(--border)}
+  td{padding:13px 18px;border-bottom:1px solid var(--border);vertical-align:middle}
   tr:last-child td{border-bottom:0}
-  tr:hover td{background:var(--card2)}
-  .tname{font-weight:600}
+  tbody tr{transition:background .1s}
+  tbody tr:hover td{background:var(--card2)}
+  tr.dim .tname,tr.dim .svc{opacity:.55}
+  .tname{font-weight:600;letter-spacing:-.01em}
   .sub{font-size:12px;color:var(--muted2)}
+  .ram{font-variant-numeric:tabular-nums;white-space:nowrap}
 
   .badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;
-    border:1px solid var(--border);border-radius:999px;padding:1px 9px;color:var(--muted)}
+    border:1px solid var(--border);border-radius:999px;padding:2px 10px;color:var(--muted)}
+  .badge.ok{border-color:var(--accent-line);background:var(--accent-dim);color:var(--accent)}
   .dot{width:7px;height:7px;border-radius:50%}
-  .ok .dot{background:var(--accent);box-shadow:0 0 6px var(--accent)}
+  .ok .dot{background:var(--accent);box-shadow:0 0 8px var(--accent)}
   .off .dot{background:var(--muted2)}
-  .svc{font-size:11px;border-radius:5px;padding:1px 7px;background:var(--card2);
-    border:1px solid var(--border);color:var(--muted);margin-right:4px}
+  .svc{display:inline-block;font-size:11px;border-radius:5px;padding:1px 7px;background:var(--card2);
+    border:1px solid var(--border);color:var(--muted);margin:1px 4px 1px 0}
+  .svc.core{color:var(--muted2);border-style:dashed}
 
   button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--border);
-    background:var(--card2);color:var(--text);padding:6px 12px;transition:all .12s}
-  button:hover{border-color:#3f3f46;background:#1b1b1f}
+    background:var(--card2);color:var(--text);padding:6px 12px;transition:all .12s;
+    display:inline-flex;align-items:center;gap:6px}
+  button:hover{border-color:var(--border2);background:#1c1c21}
   button:disabled{opacity:.5;cursor:wait}
   .btn-primary{background:var(--accent);border-color:var(--accent);color:#052e1c;font-weight:600}
   .btn-primary:hover{background:#34d399;border-color:#34d399}
-  .btn-ghost{background:transparent;border-color:transparent;color:var(--muted);padding:5px 9px}
+  .btn-ghost{background:transparent;border-color:transparent;color:var(--muted);padding:5px 10px}
   .btn-ghost:hover{background:var(--card2);border-color:transparent;color:var(--text)}
+  .btn-icon{padding:5px 7px}
   .btn-danger{color:var(--danger)}
   .btn-danger:hover{background:var(--danger-dim);border-color:transparent}
   .row-actions{display:flex;gap:2px;justify-content:flex-end}
 
-  dialog{background:var(--card);color:var(--text);border:1px solid var(--border);
+  #menu{position:fixed;z-index:40;min-width:185px;background:var(--card);
+    border:1px solid var(--border2);border-radius:10px;padding:5px;
+    box-shadow:0 16px 48px rgba(0,0,0,.55)}
+  #menu[hidden]{display:none}
+  .mi{display:flex;align-items:center;gap:9px;width:100%;padding:7px 10px;border:0;
+    background:transparent;border-radius:7px;color:var(--text);font-size:13px;text-align:left}
+  .mi .ic{color:var(--muted2)}
+  .mi:hover{background:var(--card2);border:0}
+  .mi.danger{color:var(--danger)}
+  .mi.danger .ic{color:var(--danger)}
+  .msep{height:1px;background:var(--border);margin:5px 6px}
+
+  dialog{background:var(--card);color:var(--text);border:1px solid var(--border2);
     border-radius:14px;padding:0;width:min(520px,92vw);box-shadow:0 24px 64px rgba(0,0,0,.5)}
   dialog::backdrop{background:rgba(0,0,0,.6);backdrop-filter:blur(2px)}
   .dlg-head{padding:18px 22px 0}
@@ -398,6 +463,8 @@ PAGE = r"""<!doctype html>
   .dlg-head p{margin:6px 0 0;color:var(--muted);font-size:13px}
   .dlg-body{padding:18px 22px}
   .dlg-foot{display:flex;justify-content:flex-end;gap:8px;padding:0 22px 20px}
+  .note{margin-top:14px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;
+    background:var(--bg2);font-size:12px;color:var(--muted2)}
 
   label{display:block;font-size:13px;color:var(--muted);margin:14px 0 6px}
   input[type=text]{width:100%;font:inherit;background:var(--bg);color:var(--text);
@@ -409,6 +476,7 @@ PAGE = r"""<!doctype html>
   .check{display:flex;align-items:center;gap:10px;padding:10px 12px;margin-top:8px;
     border:1px solid var(--border);border-radius:8px;cursor:pointer}
   .check:hover{background:var(--card2)}
+  .check.off{opacity:.55;cursor:not-allowed}
   .check input{accent-color:var(--accent);width:15px;height:15px}
   .check .t{font-size:13px}
   .check .d{font-size:11px;color:var(--muted2)}
@@ -423,70 +491,114 @@ PAGE = r"""<!doctype html>
   #toasts{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:50}
   .toast{background:var(--card);border:1px solid var(--border);border-left:3px solid var(--accent);
     border-radius:10px;padding:10px 14px;font-size:13px;box-shadow:0 12px 32px rgba(0,0,0,.4);
-    animation:slidein .18s ease-out}
+    animation:slidein .18s ease-out;max-width:380px}
   .toast.err{border-left-color:var(--danger);white-space:pre-wrap}
   @keyframes slidein{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
 
-  .empty{padding:48px;text-align:center;color:var(--muted2)}
+  .empty{padding:56px 20px;text-align:center;color:var(--muted2)}
+  .empty .big{font-size:15px;color:var(--muted);margin-bottom:6px}
   .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(5,46,28,.4);
-    border-top-color:#052e1c;border-radius:50%;animation:rot .7s linear infinite;vertical-align:-2px;margin-right:7px}
+    border-top-color:#052e1c;border-radius:50%;animation:rot .7s linear infinite}
   @keyframes rot{to{transform:rotate(360deg)}}
+
+  @media (max-width:720px){
+    header{padding:12px 16px}
+    main{padding:18px 16px 48px}
+    .stats{grid-template-columns:1fr}
+    .search{margin-left:0;width:100%}
+    .search input{width:100%}
+  }
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">⚡</div>
+  <div class="logo" id="logoIc"></div>
   <span class="brand">Supabase Fleet</span>
   <span class="chip" id="domainChip">…</span>
   <div class="spacer"></div>
-  <button class="btn-ghost" onclick="refresh()" title="Refresh">⟳ Refresh</button>
-  <button class="btn-primary" onclick="openCreate()">＋ New tenant</button>
+  <button class="btn-ghost" id="refreshBtn" onclick="refresh()" title="Refresh"></button>
+  <button class="btn-primary" id="newBtn" onclick="openCreate()"></button>
 </header>
 
 <main>
   <div class="stats">
     <div class="stat">
-      <div class="k">VPS CPU</div>
+      <div class="k" id="kCpu">VPS CPU</div>
       <div class="v" id="hCpu">–</div>
       <div class="bar" id="hCpuBar"><i style="width:0%"></i></div>
       <div class="hint" id="hCpuHint"></div>
     </div>
     <div class="stat">
-      <div class="k">VPS RAM</div>
+      <div class="k" id="kMem">VPS RAM</div>
       <div class="v" id="hMem">–</div>
       <div class="bar" id="hMemBar"><i style="width:0%"></i></div>
       <div class="hint" id="hMemHint"></div>
     </div>
     <div class="stat">
-      <div class="k">VPS Disk</div>
+      <div class="k" id="kDisk">VPS Disk</div>
       <div class="v" id="hDisk">–</div>
       <div class="bar" id="hDiskBar"><i style="width:0%"></i></div>
       <div class="hint" id="hDiskHint"></div>
     </div>
   </div>
-  <div class="stats">
-    <div class="stat"><div class="k">Tenants</div><div class="v" id="stTotal">–</div></div>
-    <div class="stat"><div class="k">Running</div><div class="v" id="stRun">–</div></div>
-    <div class="stat"><div class="k">Fleet RAM (live)</div><div class="v" id="stMem">–</div></div>
-  </div>
 
   <div class="card">
-    <div class="card-head"><h2>Tenants</h2></div>
+    <div class="card-head">
+      <h2>Tenants</h2>
+      <span class="summary" id="summary"></span>
+      <div class="search"><span class="ic" id="searchIc"></span>
+        <input type="text" id="q" placeholder="Filter tenants…" autocomplete="off" oninput="renderRows()">
+      </div>
+    </div>
+    <div class="tablewrap">
     <table>
       <thead><tr>
-        <th>Tenant</th><th>Services</th><th>State</th><th style="text-align:right">RAM</th><th></th>
+        <th>Tenant</th><th>Services</th><th>State</th><th style="text-align:right">RAM / cap</th><th></th>
       </tr></thead>
       <tbody id="rows"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
     </table>
+    </div>
   </div>
 </main>
 
+<div id="menu" hidden></div>
 <dialog id="dlg"></dialog>
 <div id="toasts"></div>
 
 <script>
 let S = null;
 
+// ---- inline icons (lucide-style, stroke = currentColor) -------------------
+const SV = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">';
+const I = {
+  zap: SV+'<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+  search: SV+'<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
+  key: SV+'<path d="m21 2-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>',
+  pencil: SV+'<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>',
+  dots: SV+'<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>',
+  pause: SV+'<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>',
+  play: SV+'<polygon points="6 3 20 12 6 21 6 3"/></svg>',
+  backup: SV+'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+  monitor: SV+'<rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',
+  external: SV+'<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>',
+  trash: SV+'<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>',
+  refresh: SV+'<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>',
+  plus: SV+'<path d="M5 12h14"/><path d="M12 5v14"/></svg>',
+  cpu: SV+'<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg>',
+  server: SV+'<rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
+  disk: SV+'<line x1="22" y1="12" x2="2" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" y1="16" x2="6.01" y2="16"/><line x1="10" y1="16" x2="10.01" y2="16"/></svg>',
+};
+function ic(n){ return '<span class="ic">' + I[n] + '</span>'; }
+
+document.getElementById('logoIc').innerHTML = I.zap;
+document.getElementById('searchIc').innerHTML = I.search;
+document.getElementById('refreshBtn').innerHTML = ic('refresh') + 'Refresh';
+document.getElementById('newBtn').innerHTML = ic('plus') + 'New tenant';
+document.getElementById('kCpu').innerHTML = ic('cpu') + 'VPS CPU';
+document.getElementById('kMem').innerHTML = ic('server') + 'VPS RAM';
+document.getElementById('kDisk').innerHTML = ic('disk') + 'VPS Disk';
+
+// ---- helpers ---------------------------------------------------------------
 async function api(path, opts){
   const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
   const data = await r.json().catch(() => ({}));
@@ -501,7 +613,13 @@ function toast(msg, err){
   document.getElementById('toasts').appendChild(el);
   setTimeout(() => el.remove(), err ? 9000 : 3500);
 }
+function tenant(name){ return (S && S.tenants || []).find(t => t.name === name); }
+function capMiB(cap){
+  const m = /^([0-9]+)(m|g)$/.exec(cap || '');
+  return m ? parseInt(m[1], 10) * (m[2] === 'g' ? 1024 : 1) : 0;
+}
 
+// ---- host stats ------------------------------------------------------------
 function setBar(id, pct){
   const bar = document.getElementById(id);
   bar.className = 'bar' + (pct >= 85 ? ' crit' : pct >= 70 ? ' warn' : '');
@@ -524,37 +642,59 @@ function renderHost(h){
   document.getElementById('hDiskHint').textContent = (h.disk_total_gb - h.disk_used_gb).toFixed(1) + ' GB free';
 }
 
-async function refresh(){
-  try { S = await api('/api/state'); } catch(e){ toast(e.message, true); return; }
-  document.getElementById('domainChip').textContent = '*.' + S.base_domain;
-  renderHost(S.host);
-  document.getElementById('stTotal').textContent = S.tenants.length;
-  document.getElementById('stRun').textContent = S.running;
-  document.getElementById('stMem').textContent = S.total_mem_mib >= 1024
-    ? (S.total_mem_mib/1024).toFixed(1) + ' GiB' : S.total_mem_mib + ' MiB';
+// ---- tenant table ----------------------------------------------------------
+function renderRows(){
   const rows = document.getElementById('rows');
+  if(!S) return;
+  const q = document.getElementById('q').value.trim().toLowerCase();
+  const list = S.tenants.filter(t => !q || t.name.includes(q) || t.domain.includes(q));
+  const suspended = S.tenants.length - S.running;
+  document.getElementById('summary').innerHTML =
+    '<b>' + S.running + '</b> running' +
+    (suspended ? ' · <b>' + suspended + '</b> suspended' : '') +
+    ' · <b>' + (S.total_mem_mib >= 1024 ? (S.total_mem_mib/1024).toFixed(1) + ' GiB' : S.total_mem_mib + ' MiB') + '</b> live RAM';
+
   if(!S.tenants.length){
-    rows.innerHTML = '<tr><td colspan="5" class="empty">No tenants yet — create your first client.</td></tr>';
+    rows.innerHTML = '<tr><td colspan="5"><div class="empty"><div class="big">No tenants yet</div>' +
+      'Create your first isolated client backend.<br><br>' +
+      '<button class="btn-primary" onclick="openCreate()">' + ic('plus') + 'New tenant</button></div></td></tr>';
     return;
   }
-  rows.innerHTML = S.tenants.map(t => {
+  if(!list.length){
+    rows.innerHTML = '<tr><td colspan="5" class="empty">No tenants match “' + esc(q) + '”.</td></tr>';
+    return;
+  }
+  rows.innerHTML = list.map(t => {
     const run = t.state === 'running';
-    return '<tr>' +
+    const cap = capMiB(t.ram_limit);
+    const pct = run && cap ? Math.min(100, 100 * t.mem_mib / cap) : 0;
+    return '<tr class="' + (run ? '' : 'dim') + '">' +
       '<td><div class="tname">' + esc(t.name) + '</div>' +
         '<div class="sub"><a href="https://' + esc(t.domain) + '/auth/v1/health" target="_blank">' + esc(t.domain) + '</a></div></td>' +
-      '<td>' + t.services.map(s => '<span class="svc">' + esc(s) + '</span>').join('') + '</td>' +
+      '<td>' + t.services.map(s =>
+        '<span class="svc' + (s === 'auth' || s === 'rest' ? ' core' : '') + '">' + esc(s) + '</span>').join('') + '</td>' +
       '<td><span class="badge ' + (run ? 'ok' : 'off') + '"><span class="dot"></span>' + (run ? 'running' : 'suspended') + '</span></td>' +
-      '<td style="text-align:right">' + (run ? t.mem_mib + ' MiB' : '—') + ' <span class="sub">/ ' + esc(t.ram_limit) + '</span></td>' +
+      '<td style="text-align:right;min-width:150px"><div class="ram">' +
+        (run ? t.mem_mib + ' MiB' : '—') + ' <span class="sub">/ ' + esc(t.ram_limit) + ' · ' + esc(t.cpus || '?') + ' cpu</span></div>' +
+        (run ? '<div class="bar mini' + (pct >= 85 ? ' crit' : pct >= 70 ? ' warn' : '') + '"><i style="width:' + pct + '%"></i></div>' : '') +
+      '</td>' +
       '<td><div class="row-actions">' +
-        '<button class="btn-ghost" onclick="showInfo(\'' + t.name + '\')">Keys</button>' +
-        (run
-          ? '<button class="btn-ghost" onclick="act(\'' + t.name + '\',\'suspend\')">Suspend</button>'
-          : '<button class="btn-ghost" onclick="act(\'' + t.name + '\',\'resume\')">Resume</button>') +
-        '<button class="btn-ghost" onclick="act(\'' + t.name + '\',\'backup\')">Backup</button>' +
-        '<button class="btn-ghost" onclick="act(\'' + t.name + '\',\'' + (t.studio ? 'studio_off' : 'studio_on') + '\')">' + (t.studio ? 'Studio ✓' : 'Studio') + '</button>' +
-        '<button class="btn-ghost btn-danger" onclick="openDelete(\'' + t.name + '\')">Delete</button>' +
+        '<button class="btn-ghost" onclick="showInfo(\'' + t.name + '\')" title="Connection keys">' + ic('key') + 'Keys</button>' +
+        '<button class="btn-ghost" onclick="openEdit(\'' + t.name + '\')" title="Edit caps &amp; services">' + ic('pencil') + 'Edit</button>' +
+        '<button class="btn-ghost btn-icon" onclick="toggleMenu(event, \'' + t.name + '\')" title="More actions">' + ic('dots') + '</button>' +
       '</div></td></tr>';
   }).join('');
+}
+
+async function refresh(){
+  const btn = document.getElementById('refreshBtn');
+  btn.disabled = true;
+  try { S = await api('/api/state'); }
+  catch(e){ toast(e.message, true); btn.disabled = false; return; }
+  btn.disabled = false;
+  document.getElementById('domainChip').textContent = '*.' + S.base_domain;
+  renderHost(S.host);
+  renderRows();
 }
 
 async function act(name, action){
@@ -568,6 +708,48 @@ async function act(name, action){
   refresh();
 }
 
+// ---- row overflow menu -------------------------------------------------------
+const menu = document.getElementById('menu');
+let MENU_ITEMS = [];
+function toggleMenu(ev, name){
+  ev.stopPropagation();
+  const t = tenant(name);
+  if(!t || !menu.hidden && menu.dataset.name === name){ hideMenu(); return; }
+  const run = t.state === 'running';
+  MENU_ITEMS = [
+    run ? {l:'Suspend', i:'pause', f:() => act(name, 'suspend')}
+        : {l:'Resume', i:'play', f:() => act(name, 'resume')},
+    {l:'Backup now', i:'backup', f:() => act(name, 'backup')},
+    t.studio ? {l:'Disable Studio', i:'monitor', f:() => act(name, 'studio_off')}
+             : {l:'Enable Studio', i:'monitor', f:() => act(name, 'studio_on')},
+  ];
+  if(t.studio && t.studio_domain)
+    MENU_ITEMS.push({l:'Open Studio', i:'external', f:() => window.open('https://' + t.studio_domain)});
+  MENU_ITEMS.push({sep:true}, {l:'Delete…', i:'trash', danger:true, f:() => openDelete(name)});
+
+  menu.dataset.name = name;
+  menu.innerHTML = MENU_ITEMS.map((m, idx) => m.sep
+    ? '<div class="msep"></div>'
+    : '<button class="mi' + (m.danger ? ' danger' : '') + '" data-i="' + idx + '">' + ic(m.i) + esc(m.l) + '</button>'
+  ).join('');
+  menu.hidden = false;
+  const r = ev.currentTarget.getBoundingClientRect();
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  menu.style.left = Math.max(8, Math.min(r.right - w, innerWidth - w - 8)) + 'px';
+  menu.style.top = (r.bottom + h + 12 > innerHeight ? r.top - h - 6 : r.bottom + 6) + 'px';
+}
+function hideMenu(){ menu.hidden = true; menu.dataset.name = ''; }
+menu.addEventListener('click', ev => {
+  const b = ev.target.closest('.mi');
+  if(!b) return;
+  hideMenu();
+  MENU_ITEMS[+b.dataset.i].f();
+});
+document.addEventListener('click', hideMenu);
+addEventListener('resize', hideMenu);
+addEventListener('scroll', hideMenu, true);
+
+// ---- dialogs -----------------------------------------------------------------
 const dlg = document.getElementById('dlg');
 function openDlg(html){ dlg.innerHTML = html; dlg.showModal(); }
 function closeDlg(){ dlg.close(); }
@@ -593,12 +775,21 @@ async function showInfo(name){
     '<div class="dlg-body">' +
     credRow('SUPABASE_URL', 'url') +
     credRow('SUPABASE_ANON_KEY', 'anon_key') +
-    credRow('SUPABASE_SERVICE_ROLE_KEY', 'service_role_key');
+    credRow('SUPABASE_SERVICE_ROLE_KEY', 'service_role_key') +
+    credRow('POSTGRES_PASSWORD (db superuser)', 'db_password') +
+    '<div class="note">The tenant database is not exposed to the internet — it lives on an internal Docker network. ' +
+    'Use this password over SSH (<code>docker exec -it ' + esc(CREDS.name) + '-db psql -U postgres</code>) or via Studio.</div>';
   if(CREDS.studio){
     html += credRow('Studio URL', 'studio_url') + credRow('Studio user', 'studio_user') + credRow('Studio password', 'studio_password');
   }
   html += '</div><div class="dlg-foot"><button onclick="closeDlg()">Close</button></div>';
   openDlg(html);
+}
+
+function svcCheck(id, title, desc, checked, disabled){
+  return '<label class="check' + (disabled ? ' off' : '') + '">' +
+    '<input type="checkbox" id="' + id + '"' + (checked ? ' checked' : '') + (disabled ? ' disabled' : '') + '>' +
+    '<span><div class="t">' + title + '</div><div class="d">' + desc + '</div></span></label>';
 }
 
 function openCreate(){
@@ -619,9 +810,9 @@ function openCreate(){
     '<div><label>CPU cap</label><select id="fCpus">' +
       '<option value="0.5">0.5</option><option value="1" selected>1</option><option value="2">2</option></select></div></div>' +
     '<label>Optional services</label>' +
-    '<label class="check"><input type="checkbox" id="fStorage"><span><div class="t">Storage</div><div class="d">file uploads / buckets</div></span></label>' +
-    '<label class="check"><input type="checkbox" id="fRealtime"><span><div class="t">Realtime</div><div class="d">live subscriptions / websockets</div></span></label>' +
-    '<label class="check"><input type="checkbox" id="fStudio"><span><div class="t">Studio access</div><div class="d">client-facing dashboard with login (full admin of their backend)</div></span></label>' +
+    svcCheck('fStorage', 'Storage', 'file uploads / buckets', false, false) +
+    svcCheck('fRealtime', 'Realtime', 'live subscriptions / websockets', false, false) +
+    svcCheck('fStudio', 'Studio access', 'client-facing dashboard with login (full admin of their backend)', false, false) +
     '</div><div class="dlg-foot">' +
     '<button onclick="closeDlg()">Cancel</button>' +
     '<button class="btn-primary" id="fGo" onclick="createTenant()">Create tenant</button>' +
@@ -647,6 +838,66 @@ async function createTenant(){
   }
 }
 
+function selectOpts(values, labels, current){
+  return values.map((v, i) =>
+    '<option value="' + v + '"' + (v === current ? ' selected' : '') + '>' + (labels[i] || v) + '</option>').join('');
+}
+
+function openEdit(name){
+  const t = tenant(name);
+  if(!t) return;
+  const run = t.state === 'running';
+  const rams = ['512m', '1g', '2g', '4g'];
+  if(t.ram_limit && !rams.includes(t.ram_limit)) rams.push(t.ram_limit);
+  const ramLabels = {'512m':'512 MB', '1g':'1 GB', '2g':'2 GB', '4g':'4 GB'};
+  const cpus = ['0.5', '1', '2'];
+  const cur = String(t.cpus || '1');
+  if(!cpus.includes(cur)) cpus.push(cur);
+  openDlg(
+    '<div class="dlg-head"><h3>Edit ' + esc(name) + '</h3>' +
+    '<p>Change the database resource caps and toggle optional services. Keys, domain and data are untouched.</p></div>' +
+    '<div class="dlg-body">' +
+    '<div class="grid2"><div><label>RAM cap (database)</label><select id="eRam">' +
+      selectOpts(rams, rams.map(r => ramLabels[r] || r), t.ram_limit) + '</select></div>' +
+    '<div><label>CPU cap</label><select id="eCpus">' + selectOpts(cpus, cpus, cur) + '</select></div></div>' +
+    '<label>Optional services</label>' +
+    svcCheck('eStorage', 'Storage', 'file uploads / buckets — unchecking stops the container, files are kept', t.services.includes('storage'), false) +
+    svcCheck('eRealtime', 'Realtime', 'live subscriptions / websockets', t.services.includes('realtime'), false) +
+    svcCheck('eStudio', 'Studio access', run ? 'client-facing dashboard with login (full admin of their backend)'
+      : 'resume the tenant to change Studio access', t.studio, !run) +
+    '<div class="note">' + (run
+      ? 'Changing the RAM/CPU cap recreates the database container — expect a few seconds of downtime for this tenant.'
+      : 'This tenant is suspended — changes are saved now and applied on resume.') + '</div>' +
+    '</div><div class="dlg-foot">' +
+    '<button onclick="closeDlg()">Cancel</button>' +
+    '<button class="btn-primary" id="eGo" onclick="saveEdit(\'' + name + '\')">Save changes</button>' +
+    '</div>');
+}
+
+async function saveEdit(name){
+  const t = tenant(name);
+  if(!t) return closeDlg();
+  const services = [];
+  if(document.getElementById('eStorage').checked) services.push('storage');
+  if(document.getElementById('eRealtime').checked) services.push('realtime');
+  const body = {action:'edit', ram:document.getElementById('eRam').value,
+    cpus:document.getElementById('eCpus').value, services};
+  const wantStudio = document.getElementById('eStudio').checked;
+  const go = document.getElementById('eGo');
+  go.disabled = true; go.innerHTML = '<span class="spin"></span>Applying…';
+  try {
+    await api('/api/tenants/' + name, {method:'POST', body:JSON.stringify(body)});
+    if(t.state === 'running' && wantStudio !== t.studio){
+      await api('/api/tenants/' + name, {method:'POST', body:JSON.stringify({action: wantStudio ? 'studio_on' : 'studio_off'})});
+    }
+    closeDlg(); toast('Tenant ' + name + ' updated'); await refresh();
+    if(wantStudio && !t.studio) showInfo(name);
+  } catch(e){
+    go.disabled = false; go.textContent = 'Save changes'; toast(e.message, true);
+    refresh();
+  }
+}
+
 function openDelete(name){
   openDlg(
     '<div class="dlg-head"><h3 style="color:var(--danger)">Delete ' + esc(name) + '</h3>' +
@@ -666,7 +917,8 @@ async function doDelete(name){
 }
 
 refresh();
-setInterval(refresh, 15000);
+// Auto-refresh, but never yank an open dialog/menu out from under the user.
+setInterval(() => { if(!dlg.open && menu.hidden) refresh(); }, 15000);
 </script>
 </body>
 </html>
