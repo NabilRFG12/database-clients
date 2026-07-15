@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+#
+# tenantctl — control plane for multi-tenant self-hosted Supabase.
+#
+# One VPS, one shared Caddy, one trimmed Supabase stack per client with
+# hard Docker resource caps. See multi-tenant/README.md for the full guide.
+#
+# Usage:
+#   tenantctl init --base-domain api.example.com --email you@example.com
+#   tenantctl create <name> [--ram 1g] [--cpus 1] [--services realtime,storage] [--studio]
+#                    [--jwt-secret S --anon-key K --service-key K]   (migration: import identity)
+#   tenantctl add-domain <name> <domain>      (route an old client domain to this tenant)
+#   tenantctl remove-domain <name> <domain>
+#   tenantctl list
+#   tenantctl info <name>
+#   tenantctl suspend <name>
+#   tenantctl resume <name>
+#   tenantctl backup <name>
+#   tenantctl backup-all
+#   tenantctl upgrade <name>
+#   tenantctl studio <name> on|off
+#   tenantctl fix-storage-xattrs <name>       (after migrating storage files; see MIGRATION.md)
+#   tenantctl delete <name> [--yes]
+#
+# Key generation logic follows docker/utils/generate-keys.sh, which derives
+# from Inder Singh's setup.sh (Apache License 2.0,
+# https://github.com/singh-inder/supabase-automated-self-host).
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TENANTS_DIR="$ROOT/tenants"
+TEMPLATES_DIR="$ROOT/templates"
+SHARED_DIR="$ROOT/shared"
+CADDY_TENANTS_DIR="$SHARED_DIR/caddy/tenants"
+BACKUPS_DIR="$ROOT/backups"
+CONFIG_FILE="$ROOT/config.env"
+DB_INIT_SRC="$ROOT/../docker/volumes/db"
+PROXY_NETWORK="mt-proxy"
+CADDY_CONTAINER="mt-caddy"
+
+NAME_PATTERN='^[a-z][a-z0-9-]{1,18}[a-z0-9]$'
+
+die() { echo "error: $*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed"; }
+
+usage() { sed -n '/^# Usage:/,/^#$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || die "no $CONFIG_FILE — run 'tenantctl init' first"
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+    [ -n "${BASE_DOMAIN:-}" ] || die "BASE_DOMAIN missing from config.env"
+}
+
+tenant_dir() { echo "$TENANTS_DIR/$1"; }
+
+require_tenant() {
+    [ -d "$(tenant_dir "$1")" ] || die "tenant '$1' does not exist"
+}
+
+compose() {
+    local name=$1; shift
+    docker compose --project-name "sb-$name" \
+        --project-directory "$(tenant_dir "$name")" \
+        -f "$(tenant_dir "$name")/docker-compose.yml" "$@"
+}
+
+# Replace @@KEY@@ placeholders in a template. Pure bash so values may
+# contain sed-hostile characters (bcrypt hashes, base64 secrets).
+render() {
+    local template=$1; shift
+    local out kv key value
+    out=$(cat "$template")
+    for kv in "$@"; do
+        key=${kv%%=*}
+        value=${kv#*=}
+        out=${out//"@@$key@@"/$value}
+    done
+    printf '%s\n' "$out"
+}
+
+env_get() { # env_get <name> <var>
+    sed -n "s/^$2=//p" "$(tenant_dir "$1")/.env" | head -1
+}
+
+env_set() { # env_set <name> <var> <value>
+    local file
+    file="$(tenant_dir "$1")/.env"
+    if grep -q "^$2=" "$file"; then
+        sed -i "s|^$2=.*|$2=$3|" "$file"
+    else
+        echo "$2=$3" >> "$file"
+    fi
+}
+
+b64url() { openssl enc -base64 -A | tr '+/' '-_' | tr -d '='; }
+
+gen_jwt() { # gen_jwt <role> <secret>
+    local role=$1 secret=$2
+    local header='{"alg":"HS256","typ":"JWT"}'
+    local iat exp payload h p s
+    iat=$(date +%s)
+    exp=$((iat + 5 * 3600 * 24 * 365)) # 5 years
+    payload="{\"role\":\"$role\",\"iss\":\"supabase\",\"iat\":$iat,\"exp\":$exp}"
+    h=$(printf %s "$header" | b64url)
+    p=$(printf %s "$payload" | b64url)
+    s=$(printf %s "$h.$p" | openssl dgst -binary -sha256 -hmac "$secret" | b64url)
+    printf '%s' "$h.$p.$s"
+}
+
+bcrypt_hash() { # bcrypt_hash <plaintext>
+    docker run --rm caddy:2 caddy hash-password --plaintext "$1"
+}
+
+reload_caddy() {
+    if docker ps --format '{{.Names}}' | grep -qx "$CADDY_CONTAINER"; then
+        docker exec -w /etc/caddy "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile
+    else
+        echo "warning: $CADDY_CONTAINER is not running — start it with:" >&2
+        echo "  docker compose -f $SHARED_DIR/docker-compose.yml up -d" >&2
+    fi
+}
+
+write_caddy_routes() { # write_caddy_routes <name>  (re-renders from .env)
+    local name=$1 domain studio_domain profiles out hosts extra d
+    domain=$(env_get "$name" TENANT_DOMAIN)
+    studio_domain=$(env_get "$name" STUDIO_DOMAIN)
+    profiles=$(env_get "$name" COMPOSE_PROFILES)
+    # Extra hostnames (migrated client domains) share the tenant's API site.
+    hosts=$domain
+    extra=$(env_get "$name" EXTRA_DOMAINS)
+    for d in $extra; do hosts+=", $d"; done
+    out=$(render "$TEMPLATES_DIR/caddy-site.tpl" \
+        "TENANT_NAME=$name" "TENANT_DOMAIN=$hosts")
+    if [[ ",$profiles," == *",studio,"* ]]; then
+        local user pass hash
+        user=$(env_get "$name" DASHBOARD_USERNAME)
+        pass=$(env_get "$name" DASHBOARD_PASSWORD)
+        hash=$(bcrypt_hash "$pass")
+        out+=$'\n'
+        out+=$(render "$TEMPLATES_DIR/caddy-studio.tpl" \
+            "TENANT_NAME=$name" "STUDIO_DOMAIN=$studio_domain" \
+            "DASHBOARD_USERNAME=$user" "DASHBOARD_PASSWORD_HASH=$hash")
+    fi
+    printf '%s\n' "$out" > "$CADDY_TENANTS_DIR/$name.caddy"
+}
+
+print_credentials() { # print_credentials <name>
+    local name=$1
+    cat <<EOF
+
+Tenant '$name' is up. App configuration:
+
+  SUPABASE_URL=https://$(env_get "$name" TENANT_DOMAIN)
+  SUPABASE_ANON_KEY=$(env_get "$name" ANON_KEY)
+  SUPABASE_SERVICE_ROLE_KEY=$(env_get "$name" SERVICE_ROLE_KEY)
+
+EOF
+    local profiles
+    profiles=$(env_get "$name" COMPOSE_PROFILES)
+    if [[ ",$profiles," == *",studio,"* ]]; then
+        cat <<EOF
+Studio access:
+
+  URL:      https://$(env_get "$name" STUDIO_DOMAIN)
+  Username: $(env_get "$name" DASHBOARD_USERNAME)
+  Password: $(env_get "$name" DASHBOARD_PASSWORD)
+
+EOF
+    fi
+    echo "Full settings (SMTP, SITE_URL, ...): $(tenant_dir "$name")/.env"
+}
+
+cmd_init() {
+    need docker; need openssl
+    local base_domain="" email=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --base-domain) base_domain=$2; shift 2 ;;
+            --email) email=$2; shift 2 ;;
+            *) die "unknown option for init: $1" ;;
+        esac
+    done
+    [ -n "$base_domain" ] || die "init requires --base-domain (e.g. api.example.com)"
+    [ -n "$email" ] || die "init requires --email (for Let's Encrypt)"
+
+    mkdir -p "$TENANTS_DIR" "$BACKUPS_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+# tenantctl global configuration
+BASE_DOMAIN=$base_domain
+ACME_EMAIL=$email
+EOF
+    docker network inspect "$PROXY_NETWORK" >/dev/null 2>&1 \
+        || docker network create "$PROXY_NETWORK" >/dev/null
+    docker compose -f "$SHARED_DIR/docker-compose.yml" up -d
+    cat <<EOF
+
+Initialized. Point a wildcard DNS record at this server:
+
+  *.$base_domain  ->  <this server's IP>
+
+Then create your first tenant:
+
+  tenantctl create acme --ram 1g --services storage
+
+EOF
+}
+
+cmd_create() {
+    need docker; need openssl
+    load_config
+    local name="" ram="1g" cpus="1" services="" studio=false
+    local import_jwt="" import_anon="" import_service=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --ram) ram=$2; shift 2 ;;
+            --cpus) cpus=$2; shift 2 ;;
+            --services) services=$2; shift 2 ;;
+            --studio) studio=true; shift ;;
+            --jwt-secret) import_jwt=$2; shift 2 ;;
+            --anon-key) import_anon=$2; shift 2 ;;
+            --service-key) import_service=$2; shift 2 ;;
+            -*) die "unknown option for create: $1" ;;
+            *) [ -z "$name" ] || die "unexpected argument: $1"; name=$1; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "create requires a tenant name"
+    [[ $name =~ $NAME_PATTERN ]] \
+        || die "invalid name '$name' (lowercase letters, digits, hyphens; 3-20 chars)"
+    [ ! -d "$(tenant_dir "$name")" ] || die "tenant '$name' already exists"
+    if [ -n "$import_anon$import_service" ] && [ -z "$import_jwt" ]; then
+        die "--anon-key/--service-key require --jwt-secret (keys must verify against the secret)"
+    fi
+
+    local profiles=""
+    local svc
+    for svc in ${services//,/ }; do
+        case $svc in
+            realtime|storage) profiles+="${profiles:+,}$svc" ;;
+            *) die "unknown service '$svc' (available: realtime, storage)" ;;
+        esac
+    done
+    if $studio; then profiles+="${profiles:+,}studio"; fi
+
+    local dir domain studio_domain
+    dir=$(tenant_dir "$name")
+    domain="$name.$BASE_DOMAIN"
+    studio_domain="studio.$name.$BASE_DOMAIN"
+
+    echo "Creating tenant '$name' at https://$domain ..."
+    mkdir -p "$dir/db" "$dir/storage-data"
+    cp "$TEMPLATES_DIR/docker-compose.yml" "$dir/docker-compose.yml"
+    local sql
+    for sql in roles.sql jwt.sql webhooks.sql realtime.sql; do
+        cp "$DB_INIT_SRC/$sql" "$dir/db/$sql"
+    done
+
+    # Migration support: import an existing project's identity so already-
+    # deployed apps (and live user sessions) keep working unchanged.
+    local jwt_secret anon_key service_key
+    jwt_secret=${import_jwt:-$(openssl rand -base64 30)}
+    anon_key=${import_anon:-$(gen_jwt anon "$jwt_secret")}
+    service_key=${import_service:-$(gen_jwt service_role "$jwt_secret")}
+    if [ -n "$import_jwt" ]; then
+        echo "Using imported JWT secret${import_anon:+ and API keys} (migration mode)."
+    fi
+
+    render "$TEMPLATES_DIR/tenant.env.tpl" \
+        "TENANT_NAME=$name" \
+        "TENANT_DOMAIN=$domain" \
+        "STUDIO_DOMAIN=$studio_domain" \
+        "COMPOSE_PROFILES=$profiles" \
+        "TENANT_DB_MEM_LIMIT=$ram" \
+        "TENANT_DB_CPUS=$cpus" \
+        "POSTGRES_PASSWORD=$(openssl rand -hex 16)" \
+        "JWT_SECRET=$jwt_secret" \
+        "ANON_KEY=$anon_key" \
+        "SERVICE_ROLE_KEY=$service_key" \
+        "SECRET_KEY_BASE=$(openssl rand -base64 48)" \
+        "PG_META_CRYPTO_KEY=$(openssl rand -base64 24)" \
+        "DASHBOARD_USERNAME=$name-admin" \
+        "DASHBOARD_PASSWORD=$(openssl rand -hex 12)" \
+        > "$dir/.env"
+    chmod 600 "$dir/.env"
+
+    write_caddy_routes "$name"
+    compose "$name" up -d
+    reload_caddy
+    print_credentials "$name"
+}
+
+cmd_list() {
+    load_config
+    [ -d "$TENANTS_DIR" ] || { echo "no tenants yet"; return; }
+    local dir name running
+    printf '%-22s %-12s %s\n' "TENANT" "STATE" "DOMAIN"
+    for dir in "$TENANTS_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        name=$(basename "$dir")
+        running=$(compose "$name" ps --status running --quiet 2>/dev/null | wc -l)
+        if [ "$running" -gt 0 ]; then
+            printf '%-22s %-12s %s\n' "$name" "up($running)" "$(env_get "$name" TENANT_DOMAIN)"
+        else
+            printf '%-22s %-12s %s\n' "$name" "suspended" "$(env_get "$name" TENANT_DOMAIN)"
+        fi
+    done
+}
+
+cmd_info() {
+    require_tenant "$1"
+    print_credentials "$1"
+}
+
+cmd_suspend() {
+    require_tenant "$1"
+    compose "$1" stop
+    echo "tenant '$1' suspended (data kept; 'tenantctl resume $1' to restart)"
+}
+
+cmd_resume() {
+    require_tenant "$1"
+    compose "$1" up -d
+    echo "tenant '$1' resumed"
+}
+
+cmd_backup() {
+    require_tenant "$1"
+    mkdir -p "$BACKUPS_DIR"
+    local out
+    out="$BACKUPS_DIR/$1-$(date +%Y%m%d-%H%M%S).sql.gz"
+    docker exec "$1-db" pg_dump --clean --if-exists -U postgres postgres | gzip > "$out"
+    echo "backup written: $out"
+}
+
+cmd_backup_all() {
+    local dir name failures=0
+    for dir in "$TENANTS_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        name=$(basename "$dir")
+        if docker ps --format '{{.Names}}' | grep -qx "$name-db"; then
+            cmd_backup "$name" || { echo "backup FAILED for '$name'" >&2; failures=$((failures+1)); }
+        else
+            echo "skipping '$name' (suspended)"
+        fi
+    done
+    return $failures
+}
+
+cmd_upgrade() {
+    require_tenant "$1"
+    compose "$1" pull
+    compose "$1" up -d
+    echo "tenant '$1' upgraded (edit image tags in $(tenant_dir "$1")/docker-compose.yml first to change versions)"
+}
+
+cmd_studio() {
+    local name=$1 action=$2
+    require_tenant "$name"
+    local profiles
+    profiles=$(env_get "$name" COMPOSE_PROFILES)
+    profiles=$(echo "$profiles" | tr ',' '\n' | grep -vx studio | paste -sd, -)
+    case $action in
+        on)  profiles+="${profiles:+,}studio" ;;
+        off) ;;
+        *) die "usage: tenantctl studio <name> on|off" ;;
+    esac
+    env_set "$name" COMPOSE_PROFILES "$profiles"
+    write_caddy_routes "$name"
+    if [ "$action" = on ]; then
+        compose "$name" up -d
+    else
+        compose "$name" up -d --remove-orphans
+        docker rm -f "$name-studio" "$name-meta" >/dev/null 2>&1 || true
+    fi
+    reload_caddy
+    if [ "$action" = on ]; then
+        print_credentials "$name"
+    else
+        echo "studio disabled for tenant '$name'"
+    fi
+}
+
+cmd_add_domain() { # add-domain <name> <domain>
+    local name=$1 domain=$2 extra
+    require_tenant "$name"
+    [[ $domain =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || die "invalid domain: $domain"
+    extra=$(env_get "$name" EXTRA_DOMAINS)
+    case " $extra " in *" $domain "*) die "domain '$domain' already added" ;; esac
+    env_set "$name" EXTRA_DOMAINS "${extra:+$extra }$domain"
+    write_caddy_routes "$name"
+    reload_caddy
+    cat <<EOF
+Domain '$domain' now routes to tenant '$name'.
+
+Make sure its DNS points here:  $domain  ->  this server's IP
+(Caddy will keep retrying certificate issuance until DNS resolves.)
+
+For auth emails/redirects to use this domain, also set in $(tenant_dir "$name")/.env:
+  API_EXTERNAL_URL=https://$domain
+  SITE_URL=<the client app's URL>
+then re-apply with: tenantctl resume $name
+EOF
+}
+
+cmd_remove_domain() { # remove-domain <name> <domain>
+    local name=$1 domain=$2 extra new=""
+    require_tenant "$name"
+    extra=$(env_get "$name" EXTRA_DOMAINS)
+    local d found=false
+    for d in $extra; do
+        if [ "$d" = "$domain" ]; then found=true; else new+="${new:+ }$d"; fi
+    done
+    $found || die "domain '$domain' is not attached to tenant '$name'"
+    env_set "$name" EXTRA_DOMAINS "$new"
+    write_caddy_routes "$name"
+    reload_caddy
+    echo "domain '$domain' removed from tenant '$name'"
+}
+
+cmd_rerender() { # re-generate a tenant's Caddy routes from the current template
+    require_tenant "$1"
+    write_caddy_routes "$1"
+    reload_caddy
+    echo "routes re-rendered for tenant '$1'"
+}
+
+# Newer storage-api versions (>= ~1.40) read each object's metadata from POSIX
+# extended attributes on the file. Files copied from an older storage-api (or
+# by tar/rsync without --xattrs) lack them, and every download 500s with
+# {"code":"ENODATA"}. This rebuilds the xattrs from the already-restored
+# storage.objects rows — non-destructive, idempotent, DB rows untouched.
+cmd_fix_storage_xattrs() {
+    local name=$1
+    require_tenant "$name"
+    need python3
+    local data_dir
+    data_dir="$(tenant_dir "$name")/storage-data"
+    [ -d "$data_dir/stub/$name" ] \
+        || die "no $data_dir/stub/$name — copy the files there first (MIGRATION.md section 3)"
+    docker exec "$name-db" psql -U supabase_admin -d postgres -tA -F $'\x01' -c \
+        "select bucket_id, name, coalesce(version,''),
+                coalesce(metadata->>'mimetype',''), coalesce(metadata->>'cacheControl','')
+         from storage.objects" \
+      | TENANT="$name" DATA_DIR="$data_dir" python3 - <<'PY'
+import os, sys
+tenant, root = os.environ["TENANT"], os.environ["DATA_DIR"]
+fixed = ok = missing = 0
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    bucket, name, version, mime, cache = line.split("\x01")
+    path = os.path.join(root, "stub", tenant, bucket, name, version)
+    if not os.path.isfile(path):
+        # pre-version layout: the object file sits directly at <name>
+        alt = os.path.join(root, "stub", tenant, bucket, name)
+        if os.path.isfile(alt):
+            path = alt
+        else:
+            missing += 1
+            print(f"  MISSING on disk: {bucket}/{name} (version: {version or 'none'})")
+            continue
+    want = {}
+    if mime:
+        want["user.supabase.content-type"] = mime.encode()
+    if cache:
+        want["user.supabase.cache-control"] = cache.encode()
+    changed = False
+    for attr, value in want.items():
+        try:
+            if os.getxattr(path, attr) == value:
+                continue
+        except OSError:
+            pass
+        os.setxattr(path, attr, value)
+        changed = True
+    fixed += changed
+    ok += not changed
+print(f"xattrs: {fixed} fixed, {ok} already correct, {missing} missing on disk")
+sys.exit(1 if missing else 0)
+PY
+}
+
+cmd_delete() {
+    local name="" yes=false
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --yes) yes=true; shift ;;
+            *) name=$1; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "usage: tenantctl delete <name> [--yes]"
+    require_tenant "$name"
+    if ! $yes; then
+        echo "This permanently deletes tenant '$name' INCLUDING ITS DATABASE AND FILES."
+        echo "Last backup is your safety net — consider 'tenantctl backup $name' first."
+        printf "Type the tenant name to confirm: "
+        read -r confirmation
+        [ "$confirmation" = "$name" ] || die "confirmation did not match; aborting"
+    fi
+    compose "$name" down -v --remove-orphans || true
+    rm -f "$CADDY_TENANTS_DIR/$name.caddy"
+    rm -rf "$(tenant_dir "$name")"
+    reload_caddy
+    echo "tenant '$name' deleted"
+}
+
+main() {
+    [ $# -ge 1 ] || { usage; exit 1; }
+    local cmd=$1; shift
+    case $cmd in
+        init)    cmd_init "$@" ;;
+        create)  cmd_create "$@" ;;
+        list)    cmd_list "$@" ;;
+        info)    [ $# -eq 1 ] || die "usage: tenantctl info <name>";    cmd_info "$@" ;;
+        suspend) [ $# -eq 1 ] || die "usage: tenantctl suspend <name>"; cmd_suspend "$@" ;;
+        resume)  [ $# -eq 1 ] || die "usage: tenantctl resume <name>";  cmd_resume "$@" ;;
+        backup)  [ $# -eq 1 ] || die "usage: tenantctl backup <name>";  cmd_backup "$@" ;;
+        backup-all) cmd_backup_all ;;
+        upgrade) [ $# -eq 1 ] || die "usage: tenantctl upgrade <name>"; cmd_upgrade "$@" ;;
+        studio)  [ $# -eq 2 ] || die "usage: tenantctl studio <name> on|off"; cmd_studio "$@" ;;
+        rerender)      [ $# -eq 1 ] || die "usage: tenantctl rerender <name>"; cmd_rerender "$@" ;;
+        fix-storage-xattrs) [ $# -eq 1 ] || die "usage: tenantctl fix-storage-xattrs <name>"; cmd_fix_storage_xattrs "$@" ;;
+        add-domain)    [ $# -eq 2 ] || die "usage: tenantctl add-domain <name> <domain>";    cmd_add_domain "$@" ;;
+        remove-domain) [ $# -eq 2 ] || die "usage: tenantctl remove-domain <name> <domain>"; cmd_remove_domain "$@" ;;
+        delete)  [ $# -ge 1 ] || die "usage: tenantctl delete <name> [--yes]"; cmd_delete "$@" ;;
+        -h|--help|help) usage ;;
+        *) die "unknown command: $cmd (run 'tenantctl help')" ;;
+    esac
+}
+
+main "$@"

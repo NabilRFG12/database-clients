@@ -1,0 +1,7 @@
+# Runtime state — never commit tenant data or secrets
+tenants/
+backups/
+config.env
+shared/caddy/tenants/*.caddy
+!shared/caddy/tenants/00-default.caddy
+__pycache__/

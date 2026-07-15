@@ -123,6 +123,8 @@ next-env.d.ts
 !.claude/skills/
 .claude/skills/me-*
 CLAUDE.md
+# but the multi-tenant platform instructions are project docs, keep them
+!multi-tenant/CLAUDE.md
 !.claude/CLAUDE.md
 
 #include template .env file for docker-compose
